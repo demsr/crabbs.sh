@@ -1,12 +1,3 @@
-mod auth;
-mod boards;
-mod content;
-mod db;
-mod server;
-mod state;
-mod terminal;
-mod ui;
-
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -17,9 +8,10 @@ use russh::server::{Config, Server as _};
 use russh::{MethodKind, MethodSet};
 use tokio::sync::Semaphore;
 
-use db::Db;
-use server::BbsServer;
-use state::{Limiter, Shared};
+use rust_bbs::db::Db;
+use rust_bbs::server::BbsServer;
+use rust_bbs::state::{Limiter, Shared};
+use rust_bbs::auth;
 
 /// Concurrent Argon2 hashes allowed (each needs ~19 MiB of memory).
 const MAX_CONCURRENT_HASHES: usize = 4;

@@ -2,6 +2,7 @@
 name = "rust-bbs"
 version = "0.1.0"
 edition = "2024"
+default-run = "rust-bbs"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
@@ -9,8 +10,10 @@ edition = "2024"
 anyhow = "1.0.104"
 argon2 = "0.6.0"
 async-trait = "0.1.92"
+clap = { version = "4.6.7", features = ["derive", "env"] }
 rand = "0.10.3"
 ratatui = { version = "0.30.2", default-features = false, features = ["crossterm"] }
+rpassword = "7.5.4"
 rusqlite = { version = "0.40.2", features = ["bundled"] }
 russh = { version = "0.63.3", features = ["ring"] }
 tokio = { version = "1.53.1", features = ["full"] }
