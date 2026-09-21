@@ -282,14 +282,16 @@ impl BbsHandler {
                 Response::Registered(self.register(username, password).await)
             }
             Request::ListBoards => boards::list_boards(&self.shared, self.user_id()).await,
-            Request::ListThreads { board_id } => {
-                boards::list_threads(&self.shared, board_id, None, self.user_id()).await
+            Request::ListThreads { board_id, page } => {
+                boards::list_threads(&self.shared, board_id, page, None, self.user_id()).await
             }
-            Request::OpenThread { thread_id } => {
-                boards::open_thread(&self.shared, thread_id, false, None, self.user_id()).await
+            Request::OpenThread { thread_id, target } => {
+                boards::open_thread(&self.shared, thread_id, target, None, self.user_id()).await
             }
-            Request::MarkBoardRead { board_id } => match &self.identity {
-                Some(identity) => boards::mark_board_read(&self.shared, identity, board_id).await,
+            Request::MarkBoardRead { board_id, page } => match &self.identity {
+                Some(identity) => {
+                    boards::mark_board_read(&self.shared, identity, board_id, page).await
+                }
                 None => Response::Error(INTERNAL_ERROR.into()),
             },
             Request::WhoIsOnline => self.who_is_online(),
@@ -344,12 +346,14 @@ impl BbsHandler {
                 Response::Nothing
             }
             Request::ChatSay { text, action } => self.chat_say(text, action).await,
-            Request::DeleteThread { thread_id } => match &self.identity {
-                Some(identity) => boards::delete_thread(&self.shared, identity, thread_id).await,
+            Request::DeleteThread { thread_id, page } => match &self.identity {
+                Some(identity) => {
+                    boards::delete_thread(&self.shared, identity, thread_id, page).await
+                }
                 None => Response::Error(INTERNAL_ERROR.into()),
             },
-            Request::DeletePost { post_id } => match &self.identity {
-                Some(identity) => boards::delete_post(&self.shared, identity, post_id).await,
+            Request::DeletePost { post_id, page } => match &self.identity {
+                Some(identity) => boards::delete_post(&self.shared, identity, post_id, page).await,
                 None => Response::Error(INTERNAL_ERROR.into()),
             },
             Request::CreateThread {

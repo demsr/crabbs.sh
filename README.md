@@ -65,17 +65,26 @@ Three boards (General, Tech, Off-Topic) are created on first start; manage
 boards with the admin tool (below).
 
 - Board list / thread list: ↑/↓, Enter to open, Esc to go back
-- Thread list: `n` starts a new thread, `m` marks the whole board as read
-- Thread view: ↑/↓, PgUp/PgDn or Space to scroll, `r` to reply, Esc back
+- Thread list: `n` starts a new thread, `m` marks the whole board as read,
+  ←/→ (or `,` `.`) change page
+- Thread view: ↑/↓ scroll, `r` to reply, Esc back (to the list page you came
+  from); Space/PgDn reads on, ←/→ change page, `g`/`G` first/last page
 - Editor: type normally (lines word-wrap at 78 columns), **Ctrl-D** posts,
   Esc cancels, Tab indents (4 spaces), Shift-Tab jumps back to the title,
   and Enter in the title moves to the message. Spacing and indentation are
   preserved, so ASCII art and code blocks work (lines up to 78 columns fit
   an 80-column terminal)
 
-Limits: titles 3-80 characters, messages up to 2000 characters, 200 posts per
-thread, 100 threads listed per board (most recently active first). Posting is
-limited to 10 posts per 10 minutes and 3 new threads per hour per user.
+**Paging.** Thread lists show 25 threads per page (most recently active
+first, the title says `page 2/5 · 123 threads`) and threads show 25 posts per
+page. Posts are numbered across the whole thread (`#26` is the first post on
+page 2). PgDn at the last row of a list, or Space/PgDn at the bottom of a
+thread page, simply continues onto the next page; PgUp at the top goes back
+to the bottom of the previous one. Back from a thread returns to the list page
+you opened it from, and replying opens the last page at the newest post.
+
+Limits: titles 3-80 characters, messages up to 2000 characters, 2000 posts per
+thread. Posting is limited to 10 posts per 10 minutes and 3 new threads per hour per user.
 All text is sanitised on the server (control characters and bidi/zero-width
 characters removed) regardless of what the client sent. Whitespace is kept
 as typed, apart from trailing spaces, tabs (expanded to 4 spaces), runs of
@@ -90,8 +99,10 @@ For registered users the BBS remembers how far each thread has been read:
 - the board list shows `N unread` per board;
 - the thread list marks threads with unread posts with `*` and `[N new]`,
   which also catches new replies in old threads, not just new topics;
-- opening a thread scrolls to the first unread post, tags unread posts `NEW`
-  and then marks the thread read.
+- opening a thread goes to the page containing the first unread post,
+  scrolls to it, tags unread posts `NEW` and marks the thread read **up to
+  the end of the page shown** - posts on pages you haven't reached stay
+  unread, so `[N new]` keeps counting them.
 
 Your own posts are never unread for you, and history from before you
 registered counts as read. Guests have no markers. State lives in the
@@ -169,8 +180,9 @@ Administration is split in two, on purpose:
 
 - **Inside the BBS** a sysop can moderate content in context: `x` in a
   thread list deletes the selected thread (after confirmation), `x` in a
-  thread asks for a post number and deletes that post. Sysop posts carry a
-  `[sysop]` badge. Everything else stays out of the public SSH interface.
+  thread asks for a post number (the thread-wide `#` shown on the post, which
+  must be on the page you're viewing) and deletes that post; you stay on the
+  same page. Sysop posts carry a `[sysop]` badge. Everything else stays out of the public SSH interface.
 - **`bbsadmin`** is a command-line tool for everything else, run on the
   host with shell access. It works directly on the SQLite database using the
   same code as the server, and can run while the server is up; changes apply
@@ -279,5 +291,4 @@ account from the database, so a demotion or ban takes effect at once.
 
 ## Next steps
 
-- Thread/post pagination beyond the current caps
 - Chat rooms/channels

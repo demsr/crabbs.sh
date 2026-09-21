@@ -6,7 +6,8 @@ use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
 
 use super::input::Key;
 use super::text::{Counter, wrap};
-use super::{BoardInfo, ThreadDetail, ThreadInfo};
+use super::{BoardInfo, PageTarget, ThreadDetail, ThreadInfo};
+use crate::db::POSTS_PER_PAGE;
 
 const HIGHLIGHT: Style = Style::new()
     .bg(Color::Blue)
@@ -133,10 +134,13 @@ impl BoardList {
 pub enum ThreadsEvent {
     None,
     Back,
-    DeleteThread { thread_id: i64 },
-    Open { board_id: i64, thread_id: i64 },
+    DeleteThread { thread_id: i64, page: usize },
+    /// `list_page` is the list page we came from, so Back returns to it.
+    Open { board_id: i64, thread_id: i64, list_page: usize },
     New { board_id: i64 },
-    MarkBoardRead { board_id: i64 },
+    MarkBoardRead { board_id: i64, page: usize },
+    /// Show another page of this board's thread list.
+    Page { board_id: i64, page: usize },
 }
 
 pub struct ThreadList {
@@ -150,6 +154,10 @@ pub struct ThreadList {
     /// Logged-in user (guests have no read markers).
     member: bool,
     confirm_delete: bool,
+    /// 0-based page, page count and total threads on the board.
+    page: usize,
+    pages: usize,
+    total: usize,
 }
 
 impl ThreadList {
@@ -158,6 +166,9 @@ impl ThreadList {
             sysop,
             member,
             confirm_delete: false,
+            page: 0,
+            pages: 1,
+            total: 0,
             board_id,
             board_name: String::new(),
             threads: Vec::new(),
@@ -166,9 +177,19 @@ impl ThreadList {
         }
     }
 
-    pub fn set(&mut self, board_name: String, threads: Vec<ThreadInfo>) {
+    pub fn set(
+        &mut self,
+        board_name: String,
+        threads: Vec<ThreadInfo>,
+        page: usize,
+        pages: usize,
+        total: usize,
+    ) {
         self.board_name = board_name;
         self.threads = threads;
+        self.page = page;
+        self.pages = pages;
+        self.total = total;
         self.loaded = true;
         self.selected = self.selected.min(self.threads.len().saturating_sub(1));
     }
@@ -179,6 +200,7 @@ impl ThreadList {
             if let (Key::Char('y'), Some(thread)) = (key, self.threads.get(self.selected)) {
                 return ThreadsEvent::DeleteThread {
                     thread_id: thread.id,
+                    page: self.page,
                 };
             }
             return ThreadsEvent::None;
@@ -196,6 +218,7 @@ impl ThreadList {
             Key::Char('m') if self.member => {
                 return ThreadsEvent::MarkBoardRead {
                     board_id: self.board_id,
+                    page: self.page,
                 };
             }
             Key::Enter => {
@@ -203,12 +226,49 @@ impl ThreadList {
                     return ThreadsEvent::Open {
                         board_id: self.board_id,
                         thread_id: thread.id,
+                        list_page: self.page,
                     };
                 }
             }
+            // Page keys, plus PgDn/PgUp continuing past the ends of a page.
+            Key::Right | Key::Char('>') | Key::Char('.') => return self.goto(self.page + 1),
+            Key::Left | Key::Char('<') | Key::Char(',') => {
+                return self.goto(self.page.wrapping_sub(1));
+            }
+            Key::PageDown if self.selected + 1 >= self.threads.len() => {
+                return self.goto(self.page + 1);
+            }
+            Key::PageUp if self.selected == 0 => return self.goto(self.page.wrapping_sub(1)),
             other => move_selection(&mut self.selected, self.threads.len(), other),
         }
         ThreadsEvent::None
+    }
+
+    /// Asks for another page if it exists (`usize::MAX` from a wrapped
+    /// subtraction counts as "before the first").
+    fn goto(&self, page: usize) -> ThreadsEvent {
+        if page < self.pages && page != self.page {
+            ThreadsEvent::Page {
+                board_id: self.board_id,
+                page,
+            }
+        } else {
+            ThreadsEvent::None
+        }
+    }
+
+    fn title(&self) -> String {
+        if self.pages > 1 {
+            format!(
+                "Board: {} · page {}/{} · {} threads",
+                self.board_name,
+                self.page + 1,
+                self.pages,
+                self.total
+            )
+        } else {
+            format!("Board: {} · {} threads", self.board_name, self.total)
+        }
     }
 
     pub fn draw(&self, frame: &mut Frame, area: Rect) {
@@ -252,7 +312,7 @@ impl ThreadList {
         let list = List::new(items)
             .block(
                 Block::default()
-                    .title(format!("Board: {}", self.board_name))
+                    .title(self.title())
                     .borders(Borders::ALL),
             )
             .highlight_style(HIGHLIGHT)
@@ -276,6 +336,9 @@ impl ThreadList {
             );
         } else {
             let mut text = String::from("Enter: read · n: new thread");
+            if self.pages > 1 {
+                text.push_str(" · ←/→: page");
+            }
             if self.member {
                 text.push_str(" · m: mark all read");
             }
@@ -292,9 +355,11 @@ impl ThreadList {
 
 pub enum ThreadEvent {
     None,
-    DeletePost { post_id: i64 },
-    Back { board_id: i64 },
+    DeletePost { post_id: i64, page: usize },
+    Back { board_id: i64, list_page: usize },
     Reply { thread_id: i64, title: String },
+    /// Show another page of this thread.
+    Goto { thread_id: i64, target: PageTarget },
 }
 
 pub struct ThreadView {
@@ -304,6 +369,12 @@ pub struct ThreadView {
     title: String,
     posts: Vec<super::PostInfo>,
     loaded: bool,
+    /// 0-based page of the thread being shown, page count, total posts.
+    page: usize,
+    pages: usize,
+    total: usize,
+    /// The thread-list page this thread was opened from (for Back).
+    list_page: usize,
     sysop: bool,
     /// Digits typed so far while asking which post to delete.
     delete_prompt: Option<String>,
@@ -318,8 +389,12 @@ pub struct ThreadView {
 }
 
 impl ThreadView {
-    pub fn loading(board_id: i64, thread_id: i64, sysop: bool) -> Self {
+    pub fn loading(board_id: i64, thread_id: i64, sysop: bool, list_page: usize) -> Self {
         Self {
+            page: 0,
+            pages: 1,
+            total: 0,
+            list_page,
             sysop,
             delete_prompt: None,
             board_id,
@@ -335,8 +410,15 @@ impl ThreadView {
         }
     }
 
-    pub fn from_detail(detail: ThreadDetail, to_end: bool, sysop: bool) -> Self {
-        let mut view = Self::loading(detail.board_id, detail.id, sysop);
+    pub fn list_page(&self) -> usize {
+        self.list_page
+    }
+
+    pub fn from_detail(detail: ThreadDetail, to_end: bool, sysop: bool, list_page: usize) -> Self {
+        let mut view = Self::loading(detail.board_id, detail.id, sysop, list_page);
+        view.page = detail.page;
+        view.pages = detail.pages;
+        view.total = detail.total;
         view.board_name = detail.board_name;
         view.title = detail.title;
         view.posts = detail.posts;
@@ -359,13 +441,43 @@ impl ThreadView {
         self.scroll.set(now.saturating_add_signed(delta).min(max));
     }
 
+    /// Number of the first post on this page, minus one (posts are numbered
+    /// across the whole thread, not per page).
+    fn first_index(&self) -> usize {
+        self.page * POSTS_PER_PAGE
+    }
+
+    fn max_scroll(&self) -> usize {
+        self.total_lines.get().saturating_sub(self.page_height.get())
+    }
+
+    fn at_bottom(&self) -> bool {
+        self.scroll.get().min(self.max_scroll()) == self.max_scroll()
+    }
+
+    fn at_top(&self) -> bool {
+        self.scroll.get() == 0
+    }
+
+    fn goto(&self, target: PageTarget) -> ThreadEvent {
+        ThreadEvent::Goto {
+            thread_id: self.thread_id,
+            target,
+        }
+    }
+
     fn handle_delete_prompt(&mut self, mut input: String, key: Key) -> ThreadEvent {
         match key {
             Key::Esc => return ThreadEvent::None,
             Key::Enter => {
+                // The number is thread-wide; only posts on this page can be picked.
                 let number: usize = input.parse().unwrap_or(0);
-                return match number.checked_sub(1).and_then(|i| self.posts.get(i)) {
-                    Some(post) => ThreadEvent::DeletePost { post_id: post.id },
+                let index = number.checked_sub(1 + self.first_index());
+                return match index.and_then(|i| self.posts.get(i)) {
+                    Some(post) => ThreadEvent::DeletePost {
+                        post_id: post.id,
+                        page: self.page,
+                    },
                     None => ThreadEvent::None,
                 };
             }
@@ -388,6 +500,7 @@ impl ThreadView {
             Key::Esc | Key::Char('q') => {
                 return ThreadEvent::Back {
                     board_id: self.board_id,
+                    list_page: self.list_page,
                 };
             }
             Key::Char('x') if self.sysop && self.loaded => {
@@ -401,10 +514,38 @@ impl ThreadView {
             }
             Key::Up | Key::Char('k') => self.scroll_by(-1),
             Key::Down | Key::Char('j') | Key::Enter => self.scroll_by(1),
-            Key::PageUp | Key::Char('b') => self.scroll_by(-page),
-            Key::PageDown | Key::Char(' ') => self.scroll_by(page),
-            Key::Home | Key::Char('g') => self.scroll.set(0),
-            Key::End | Key::Char('G') => self.scroll.set(usize::MAX),
+            // Reading on past the end of a page continues on the next one.
+            Key::PageDown | Key::Char(' ') => {
+                if self.at_bottom() && self.page + 1 < self.pages {
+                    return self.goto(PageTarget::Page(self.page + 1));
+                }
+                self.scroll_by(page);
+            }
+            Key::PageUp | Key::Char('b') => {
+                if self.at_top() && self.page > 0 {
+                    return self.goto(PageTarget::PageEnd(self.page - 1));
+                }
+                self.scroll_by(-page);
+            }
+            Key::Right | Key::Char('>') | Key::Char('.') if self.page + 1 < self.pages => {
+                return self.goto(PageTarget::Page(self.page + 1));
+            }
+            Key::Left | Key::Char('<') | Key::Char(',') if self.page > 0 => {
+                return self.goto(PageTarget::Page(self.page - 1));
+            }
+            // First / last page of the thread (or top / bottom if single-page).
+            Key::Home | Key::Char('g') => {
+                if self.page > 0 {
+                    return self.goto(PageTarget::Page(0));
+                }
+                self.scroll.set(0);
+            }
+            Key::End | Key::Char('G') => {
+                if self.page + 1 < self.pages {
+                    return self.goto(PageTarget::Last);
+                }
+                self.scroll.set(usize::MAX);
+            }
             _ => {}
         }
         ThreadEvent::None
@@ -413,7 +554,18 @@ impl ThreadView {
     pub fn draw(&self, frame: &mut Frame, area: Rect) {
         let (body, help) = split_help(area);
         let block = Block::default()
-            .title(format!("{} › {}", self.board_name, self.title))
+            .title(if self.pages > 1 {
+                format!(
+                    "{} › {} · page {}/{} · {} posts",
+                    self.board_name,
+                    self.title,
+                    self.page + 1,
+                    self.pages,
+                    self.total
+                )
+            } else {
+                format!("{} › {}", self.board_name, self.title)
+            })
             .borders(Borders::ALL);
         let inner = block.inner(body);
 
@@ -426,7 +578,7 @@ impl ThreadView {
             post_starts.push(lines.len());
             lines.push(Line::from(vec![
                 Span::styled(
-                    format!("#{} {}", i + 1, post.author),
+                    format!("#{} {}", self.first_index() + i + 1, post.author),
                     Style::default()
                         .fg(Color::Cyan)
                         .add_modifier(Modifier::BOLD),
@@ -471,18 +623,195 @@ impl ThreadView {
                 help,
             );
             frame.set_cursor_position((help.x + (label.len() + input.len()) as u16, help.y));
-        } else if self.sysop {
-            draw_help(
-                frame,
-                help,
-                "↑/↓/PgUp/PgDn: scroll · r: reply · x: delete post (sysop) · Esc: back",
-            );
         } else {
-            draw_help(
-                frame,
-                help,
-                "↑/↓/PgUp/PgDn: scroll · r: reply · Esc: back to threads",
-            );
+            let mut text = String::from("↑/↓: scroll · Space/PgDn: read on");
+            if self.pages > 1 {
+                text.push_str(" · ←/→: page · g/G: first/last");
+            }
+            text.push_str(" · r: reply");
+            if self.sysop {
+                text.push_str(" · x: delete post");
+            }
+            text.push_str(" · Esc: back");
+            draw_help(frame, help, &text);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ui::PostInfo;
+
+    fn threads(n: usize) -> Vec<ThreadInfo> {
+        (0..n as i64)
+            .map(|id| ThreadInfo {
+                id,
+                title: format!("T{id}"),
+                author: "a".into(),
+                post_count: 1,
+                last_post: String::new(),
+                unread: 0,
+            })
+            .collect()
+    }
+
+    fn list(page: usize, pages: usize, rows: usize) -> ThreadList {
+        let mut l = ThreadList::loading(1, false, true);
+        l.set("General".into(), threads(rows), page, pages, pages * 25);
+        l
+    }
+
+    fn view(page: usize, pages: usize, sysop: bool) -> ThreadView {
+        let posts = (0..POSTS_PER_PAGE as i64)
+            .map(|i| PostInfo {
+                id: 1000 + page as i64 * 100 + i,
+                author: "a".into(),
+                author_is_sysop: false,
+                body: "x".into(),
+                created: String::new(),
+                unread: false,
+            })
+            .collect();
+        let v = ThreadView::from_detail(
+            ThreadDetail {
+                id: 9,
+                board_id: 1,
+                board_name: "General".into(),
+                title: "T".into(),
+                posts,
+                page,
+                pages,
+                total: pages * POSTS_PER_PAGE,
+            },
+            false,
+            sysop,
+            2,
+        );
+        // Pretend a draw happened: 100 lines of content in a 20-line window.
+        v.total_lines.set(100);
+        v.page_height.set(20);
+        v
+    }
+
+    fn goto(target: PageTarget) -> impl Fn(&ThreadEvent) -> bool {
+        move |e| matches!(e, ThreadEvent::Goto { thread_id: 9, target: t } if *t == target)
+    }
+
+    #[test]
+    fn thread_list_page_keys_stay_within_bounds() {
+        let mut l = list(1, 3, 25);
+        assert!(matches!(l.handle(Key::Right), ThreadsEvent::Page { board_id: 1, page: 2 }));
+        assert!(matches!(l.handle(Key::Left), ThreadsEvent::Page { board_id: 1, page: 0 }));
+
+        let mut first = list(0, 3, 25);
+        assert!(matches!(first.handle(Key::Left), ThreadsEvent::None), "nothing before page 1");
+        assert!(matches!(first.handle(Key::PageUp), ThreadsEvent::None));
+
+        let mut last = list(2, 3, 25);
+        assert!(matches!(last.handle(Key::Right), ThreadsEvent::None), "nothing after the last page");
+        assert!(matches!(last.handle(Key::End), ThreadsEvent::None));
+        assert!(matches!(last.handle(Key::PageDown), ThreadsEvent::None), "already at the end");
+
+        let mut single = list(0, 1, 5);
+        assert!(matches!(single.handle(Key::Right), ThreadsEvent::None));
+    }
+
+    #[test]
+    fn thread_list_pgdn_and_pgup_continue_across_pages_only_at_the_edges() {
+        let mut l = list(0, 3, 25);
+        assert!(matches!(l.handle(Key::PageDown), ThreadsEvent::None), "moves the selection first");
+        assert_eq!(l.selected, 10);
+        l.handle(Key::PageDown);
+        l.handle(Key::PageDown);
+        assert_eq!(l.selected, 24);
+        assert!(matches!(l.handle(Key::PageDown), ThreadsEvent::Page { page: 1, .. }));
+
+        let mut mid = list(1, 3, 25);
+        assert!(matches!(mid.handle(Key::PageUp), ThreadsEvent::Page { page: 0, .. }), "already at the top row");
+    }
+
+    #[test]
+    fn opening_and_actions_remember_the_list_page() {
+        let mut l = list(2, 3, 25);
+        assert!(matches!(l.handle(Key::Enter), ThreadsEvent::Open { thread_id: 0, list_page: 2, .. }));
+        assert!(matches!(l.handle(Key::Char('m')), ThreadsEvent::MarkBoardRead { page: 2, .. }));
+    }
+
+    #[test]
+    fn reading_on_continues_onto_the_next_page_at_the_bottom() {
+        let mut v = view(0, 3, false);
+        // Mid-page: Space just scrolls.
+        assert!(matches!(v.handle(Key::Char(' ')), ThreadEvent::None));
+        assert!(v.scroll.get() > 0);
+        // Scroll to the bottom, then Space moves on.
+        v.scroll.set(usize::MAX);
+        assert!(goto(PageTarget::Page(1))(&v.handle(Key::Char(' '))));
+        // On the last page there is nowhere to go.
+        let mut last = view(2, 3, false);
+        last.scroll.set(usize::MAX);
+        assert!(matches!(last.handle(Key::Char(' ')), ThreadEvent::None));
+    }
+
+    #[test]
+    fn paging_back_lands_at_the_bottom_of_the_previous_page() {
+        let mut v = view(1, 3, false);
+        v.scroll.set(5);
+        assert!(matches!(v.handle(Key::PageUp), ThreadEvent::None), "scrolls up first");
+        v.scroll.set(0);
+        assert!(goto(PageTarget::PageEnd(0))(&v.handle(Key::PageUp)));
+        let mut first = view(0, 3, false);
+        assert!(matches!(first.handle(Key::PageUp), ThreadEvent::None));
+    }
+
+    #[test]
+    fn explicit_page_keys_and_first_last() {
+        let mut v = view(1, 3, false);
+        assert!(goto(PageTarget::Page(2))(&v.handle(Key::Right)));
+        assert!(goto(PageTarget::Page(0))(&v.handle(Key::Left)));
+        assert!(goto(PageTarget::Page(0))(&v.handle(Key::Char('g'))));
+        assert!(goto(PageTarget::Last)(&v.handle(Key::Char('G'))));
+
+        let mut first = view(0, 3, false);
+        assert!(matches!(first.handle(Key::Left), ThreadEvent::None));
+        first.scroll.set(40);
+        assert!(matches!(first.handle(Key::Char('g')), ThreadEvent::None), "on page 1, g scrolls to the top");
+        assert_eq!(first.scroll.get(), 0);
+
+        let mut last = view(2, 3, false);
+        assert!(matches!(last.handle(Key::Right), ThreadEvent::None));
+        assert!(matches!(last.handle(Key::Char('G')), ThreadEvent::None), "on the last page, G scrolls to the bottom");
+        assert_eq!(last.scroll.get(), usize::MAX);
+    }
+
+    #[test]
+    fn back_and_reply_carry_the_right_context() {
+        let mut v = view(1, 3, false);
+        assert!(matches!(v.handle(Key::Esc), ThreadEvent::Back { board_id: 1, list_page: 2 }));
+        assert!(matches!(v.handle(Key::Char('r')), ThreadEvent::Reply { thread_id: 9, .. }));
+    }
+
+    #[test]
+    fn delete_prompt_uses_thread_wide_numbers_on_this_page_only() {
+        // Page 2 of 3 shows posts #26..#50 (0-based page 1).
+        let mut v = view(1, 3, true);
+        let ids: Vec<i64> = v.posts.iter().map(|p| p.id).collect();
+
+        v.handle(Key::Char('x'));
+        for c in "27".chars() {
+            v.handle(Key::Char(c));
+        }
+        assert!(matches!(v.handle(Key::Enter), ThreadEvent::DeletePost { post_id, page: 1 } if post_id == ids[1]));
+
+        // #3 lives on page 1, so it can't be picked from here.
+        v.handle(Key::Char('x'));
+        v.handle(Key::Char('3'));
+        assert!(matches!(v.handle(Key::Enter), ThreadEvent::None));
+        // Neither can #60.
+        v.handle(Key::Char('x'));
+        for c in "60".chars() {
+            v.handle(Key::Char(c));
+        }
+        assert!(matches!(v.handle(Key::Enter), ThreadEvent::None));
     }
 }

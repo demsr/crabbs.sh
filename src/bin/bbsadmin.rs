@@ -184,7 +184,7 @@ fn run(db: &Db, command: Command) -> anyhow::Result<()> {
             };
             println!("Board {board_id}: {name}");
             println!("{:>5}  {:<40}  {:<16}  {:>5}  {}", "ID", "TITLE", "AUTHOR", "POSTS", "LAST POST");
-            for t in db_err(db.list_threads(board_id, None), "threads")? {
+            for t in db_err(db.list_threads(board_id, None, 0, usize::MAX >> 1), "threads")? {
                 println!(
                     "{:>5}  {:<40}  {:<16}  {:>5}  {}",
                     t.id,

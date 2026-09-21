@@ -112,8 +112,12 @@ fn viewer_id(viewer: Option<i64>) -> i64 {
     viewer.unwrap_or(-1)
 }
 
-pub const MAX_THREADS_LISTED: usize = 100;
-pub const MAX_POSTS_PER_THREAD: usize = 200;
+/// Rows per page in a board's thread list.
+pub const THREADS_PER_PAGE: usize = 25;
+/// Posts per page in a thread.
+pub const POSTS_PER_PAGE: usize = 25;
+/// Upper bound on a thread's length (keeps one thread from growing forever).
+pub const MAX_POSTS_PER_THREAD: usize = 2000;
 /// Messages kept per user in each folder (inbox, sent).
 pub const MAX_MAILBOX: usize = 200;
 /// At most this many messages from one person to another per window, so a
@@ -275,6 +279,7 @@ pub struct ThreadHead {
     pub board_id: i64,
     pub board_name: String,
     pub title: String,
+    pub post_count: i64,
 }
 
 pub struct PostRecord {
@@ -543,11 +548,21 @@ impl Db {
             .optional()?)
     }
 
-    /// Most recently active threads first, at most `MAX_THREADS_LISTED`.
+    pub fn count_threads(&self, board_id: i64) -> Result<i64, DbError> {
+        Ok(self.conn().query_row(
+            "SELECT COUNT(*) FROM threads WHERE board_id = ?1",
+            params![board_id],
+            |r| r.get(0),
+        )?)
+    }
+
+    /// Most recently active threads first: `limit` rows starting at `offset`.
     pub fn list_threads(
         &self,
         board_id: i64,
         viewer: Option<i64>,
+        offset: usize,
+        limit: usize,
     ) -> Result<Vec<ThreadRecord>, DbError> {
         let conn = self.conn();
         let mut stmt = conn.prepare(&format!(
@@ -556,13 +571,14 @@ impl Db {
                     (SELECT COUNT(*) FROM posts p WHERE p.thread_id = t.id AND {UNREAD})
              FROM threads t JOIN users u ON u.id = t.author_id
              WHERE t.board_id = :board
-             ORDER BY t.last_post_at DESC, t.id DESC LIMIT :limit"
+             ORDER BY t.last_post_at DESC, t.id DESC LIMIT :limit OFFSET :offset"
         ))?;
         let rows = stmt.query_map(
             named_params! {
                 ":uid": viewer_id(viewer),
                 ":board": board_id,
-                ":limit": MAX_THREADS_LISTED as i64,
+                ":limit": limit as i64,
+                ":offset": offset as i64,
             },
             |row| {
                 Ok(ThreadRecord {
@@ -582,7 +598,7 @@ impl Db {
         Ok(self
             .conn()
             .query_row(
-                "SELECT t.id, t.board_id, b.name, t.title
+                "SELECT t.id, t.board_id, b.name, t.title, t.post_count
                  FROM threads t JOIN boards b ON b.id = t.board_id WHERE t.id = ?1",
                 params![thread_id],
                 |row| {
@@ -591,16 +607,30 @@ impl Db {
                         board_id: row.get(1)?,
                         board_name: row.get(2)?,
                         title: row.get(3)?,
+                        post_count: row.get(4)?,
                     })
                 },
             )
             .optional()?)
     }
 
+    /// Every post in the thread (up to `MAX_POSTS_PER_THREAD`), for the
+    /// admin tool. The BBS itself reads a page at a time.
     pub fn list_posts(
         &self,
         thread_id: i64,
         viewer: Option<i64>,
+    ) -> Result<Vec<PostRecord>, DbError> {
+        self.list_posts_page(thread_id, viewer, 0, MAX_POSTS_PER_THREAD)
+    }
+
+    /// `limit` posts in order, starting at the `offset`-th (0-based).
+    pub fn list_posts_page(
+        &self,
+        thread_id: i64,
+        viewer: Option<i64>,
+        offset: usize,
+        limit: usize,
     ) -> Result<Vec<PostRecord>, DbError> {
         let conn = self.conn();
         let mut stmt = conn.prepare(&format!(
@@ -608,13 +638,14 @@ impl Db {
                     strftime('{TIME_FORMAT}', p.created_at, 'unixepoch'),
                     {UNREAD}
              FROM posts p JOIN users u ON u.id = p.author_id
-             WHERE p.thread_id = :thread ORDER BY p.id LIMIT :limit"
+             WHERE p.thread_id = :thread ORDER BY p.id LIMIT :limit OFFSET :offset"
         ))?;
         let rows = stmt.query_map(
             named_params! {
                 ":uid": viewer_id(viewer),
                 ":thread": thread_id,
-                ":limit": MAX_POSTS_PER_THREAD as i64,
+                ":limit": limit as i64,
+                ":offset": offset as i64,
             },
             |row| {
                 Ok(PostRecord {
@@ -641,6 +672,46 @@ impl Db {
             named_params! {":uid": user_id, ":thread": thread_id},
         )?;
         Ok(())
+    }
+
+    /// Marks the thread read up to and including `post_id` - what was
+    /// actually shown - so posts on pages the reader hasn't reached stay
+    /// unread. Forward-only, like `mark_thread_read`.
+    pub fn mark_thread_read_upto(
+        &self,
+        user_id: i64,
+        thread_id: i64,
+        post_id: i64,
+    ) -> Result<(), DbError> {
+        self.conn().execute(
+            "INSERT INTO thread_reads (user_id, thread_id, last_read_post_id)
+             VALUES (:uid, :thread, :post)
+             ON CONFLICT(user_id, thread_id) DO UPDATE
+                 SET last_read_post_id = MAX(last_read_post_id, excluded.last_read_post_id)",
+            named_params! {":uid": user_id, ":thread": thread_id, ":post": post_id},
+        )?;
+        Ok(())
+    }
+
+    /// Position (0-based, counting all posts in order) of the first post the
+    /// viewer hasn't read, or `None` if they're up to date.
+    pub fn first_unread_index(&self, user_id: i64, thread_id: i64) -> Result<Option<i64>, DbError> {
+        let conn = self.conn();
+        let first: Option<i64> = conn.query_row(
+            &format!(
+                "SELECT MIN(p.id) FROM posts p WHERE p.thread_id = :thread AND {UNREAD}"
+            ),
+            named_params! {":uid": user_id, ":thread": thread_id},
+            |r| r.get(0),
+        )?;
+        let Some(first) = first else {
+            return Ok(None);
+        };
+        Ok(Some(conn.query_row(
+            "SELECT COUNT(*) FROM posts WHERE thread_id = ?1 AND id < ?2",
+            params![thread_id, first],
+            |r| r.get(0),
+        )?))
     }
 
     pub fn mark_board_read(&self, user_id: i64, board_id: i64) -> Result<(), DbError> {
@@ -1173,7 +1244,7 @@ mod tests {
 
         let d = db.delete_post(posts[1].id).unwrap();
         assert!(!d.thread_deleted);
-        assert_eq!(db.list_threads(board, None).unwrap()[0].post_count, 1);
+        assert_eq!(db.list_threads(board, None, 0, 100).unwrap()[0].post_count, 1);
 
         let d = db.delete_post(posts[0].id).unwrap();
         assert!(d.thread_deleted);
@@ -1208,15 +1279,15 @@ mod tests {
         db.add_post(t, alice, "second").unwrap();
 
         // Bob sees both of Alice's posts as unread; Alice sees none of her own.
-        assert_eq!(db.list_threads(board, Some(bob)).unwrap()[0].unread, 2);
-        assert_eq!(db.list_threads(board, Some(alice)).unwrap()[0].unread, 0);
+        assert_eq!(db.list_threads(board, Some(bob), 0, 100).unwrap()[0].unread, 2);
+        assert_eq!(db.list_threads(board, Some(alice), 0, 100).unwrap()[0].unread, 0);
         assert_eq!(db.list_boards(Some(bob)).unwrap()[0].unread_threads, 1);
         assert_eq!(db.unread_thread_total(bob).unwrap(), 1);
         let flags: Vec<bool> = db.list_posts(t, Some(bob)).unwrap().iter().map(|p| p.unread).collect();
         assert_eq!(flags, [true, true]);
 
         db.mark_thread_read(bob, t).unwrap();
-        assert_eq!(db.list_threads(board, Some(bob)).unwrap()[0].unread, 0);
+        assert_eq!(db.list_threads(board, Some(bob), 0, 100).unwrap()[0].unread, 0);
         assert_eq!(db.unread_thread_total(bob).unwrap(), 0);
 
         // A later reply is unread again, and only that one.
@@ -1227,16 +1298,16 @@ mod tests {
         // Bob's own reply never counts as unread for him.
         db.mark_thread_read(bob, t).unwrap();
         db.add_post(t, bob, "mine").unwrap();
-        assert_eq!(db.list_threads(board, Some(bob)).unwrap()[0].unread, 0);
+        assert_eq!(db.list_threads(board, Some(bob), 0, 100).unwrap()[0].unread, 0);
         // ...but it is unread for Alice.
-        assert_eq!(db.list_threads(board, Some(alice)).unwrap()[0].unread, 1);
+        assert_eq!(db.list_threads(board, Some(alice), 0, 100).unwrap()[0].unread, 1);
     }
 
     #[test]
     fn guests_never_have_unread() {
         let (db, alice, _bob, board) = alice_bob();
         db.create_thread(board, alice, "Hello", "text").unwrap();
-        assert_eq!(db.list_threads(board, None).unwrap()[0].unread, 0);
+        assert_eq!(db.list_threads(board, None, 0, 100).unwrap()[0].unread, 0);
         assert_eq!(db.list_boards(None).unwrap()[0].unread_threads, 0);
     }
 
@@ -1247,10 +1318,10 @@ mod tests {
         // Make the thread predate anyone who registers afterwards.
         db.conn().execute("UPDATE posts SET created_at = created_at - 1000", []).unwrap();
         let carol = db.create_user("carol", "h").unwrap();
-        assert_eq!(db.list_threads(board, Some(carol)).unwrap()[0].unread, 0);
+        assert_eq!(db.list_threads(board, Some(carol), 0, 100).unwrap()[0].unread, 0);
         // A post made after she registered is new to her.
         db.add_post(t, alice, "fresh").unwrap();
-        assert_eq!(db.list_threads(board, Some(carol)).unwrap()[0].unread, 1);
+        assert_eq!(db.list_threads(board, Some(carol), 0, 100).unwrap()[0].unread, 1);
     }
 
     #[test]
@@ -1379,6 +1450,93 @@ mod tests {
         let first = db.list_folder(dave, Folder::Inbox).unwrap()[0].id;
         db.delete_message(dave, first).unwrap();
         db.send_message(alice, dave, "Hi", "x").unwrap();
+    }
+
+    /// A board with `n` threads titled "T0".."T{n-1}" (T{n-1} newest).
+    fn board_with_threads(n: usize) -> (Db, i64, i64, i64) {
+        let (db, alice, bob, board) = alice_bob();
+        for i in 0..n {
+            let t = db.create_thread(board, alice, &format!("T{i}"), "body").unwrap();
+            // Make activity order deterministic regardless of the clock.
+            db.conn()
+                .execute("UPDATE threads SET last_post_at = ?1 WHERE id = ?2", params![1_000 + i as i64, t])
+                .unwrap();
+        }
+        (db, alice, bob, board)
+    }
+
+    #[test]
+    fn thread_list_pages_cover_everything_exactly_once() {
+        let (db, _, _, board) = board_with_threads(60);
+        assert_eq!(db.count_threads(board).unwrap(), 60);
+        let mut seen = Vec::new();
+        for page in 0..3 {
+            let rows = db.list_threads(board, None, page * THREADS_PER_PAGE, THREADS_PER_PAGE).unwrap();
+            assert_eq!(rows.len(), if page < 2 { THREADS_PER_PAGE } else { 10 });
+            seen.extend(rows.into_iter().map(|t| t.title));
+        }
+        let expected: Vec<String> = (0..60).rev().map(|i| format!("T{i}")).collect();
+        assert_eq!(seen, expected, "newest first, no gaps, no repeats");
+        assert!(db.list_threads(board, None, 75, THREADS_PER_PAGE).unwrap().is_empty());
+    }
+
+    #[test]
+    fn post_pages_and_the_higher_cap() {
+        let (db, alice, _, board) = alice_bob();
+        let t = db.create_thread(board, alice, "Long", "post 0").unwrap();
+        for i in 1..60 {
+            db.add_post(t, alice, &format!("post {i}")).unwrap();
+        }
+        assert_eq!(db.thread_head(t).unwrap().unwrap().post_count, 60);
+        let page = |n: usize| -> Vec<String> {
+            db.list_posts_page(t, None, n * POSTS_PER_PAGE, POSTS_PER_PAGE)
+                .unwrap()
+                .into_iter()
+                .map(|p| p.body)
+                .collect()
+        };
+        assert_eq!(page(0).first().unwrap(), "post 0");
+        assert_eq!(page(1).first().unwrap(), "post 25");
+        assert_eq!(page(2), (50..60).map(|i| format!("post {i}")).collect::<Vec<_>>());
+        assert_eq!(db.list_posts(t, None).unwrap().len(), 60, "admin listing sees them all");
+
+        // The cap is far above the old 200: push the counter near it.
+        db.conn().execute("UPDATE threads SET post_count = ?1 WHERE id = ?2", params![MAX_POSTS_PER_THREAD as i64 - 1, t]).unwrap();
+        db.add_post(t, alice, "last one").unwrap();
+        assert_eq!(db.add_post(t, alice, "too many"), Err(DbError::LimitReached));
+    }
+
+    #[test]
+    fn reading_a_page_only_marks_that_far() {
+        let (db, alice, bob, board) = alice_bob();
+        let t = db.create_thread(board, alice, "Long", "post 0").unwrap();
+        for i in 1..60 {
+            db.add_post(t, alice, &format!("post {i}")).unwrap();
+        }
+        assert_eq!(db.first_unread_index(bob, t).unwrap(), Some(0));
+        assert_eq!(db.first_unread_index(alice, t).unwrap(), None, "your own posts are never unread");
+
+        // Bob reads page 1 (posts 0..25).
+        let page = db.list_posts_page(t, Some(bob), 0, POSTS_PER_PAGE).unwrap();
+        assert!(page.iter().all(|p| p.unread));
+        db.mark_thread_read_upto(bob, t, page.last().unwrap().id).unwrap();
+
+        // The next unread post is #26, and 35 remain unread on the thread list.
+        assert_eq!(db.first_unread_index(bob, t).unwrap(), Some(25));
+        assert_eq!(db.list_threads(board, Some(bob), 0, 10).unwrap()[0].unread, 35);
+        assert_eq!(db.list_boards(Some(bob)).unwrap()[0].unread_threads, 1);
+
+        // Going back to an earlier page never un-reads anything.
+        let first_id = db.list_posts_page(t, Some(bob), 0, 1).unwrap()[0].id;
+        db.mark_thread_read_upto(bob, t, first_id).unwrap();
+        assert_eq!(db.first_unread_index(bob, t).unwrap(), Some(25));
+
+        // Reading the rest finishes it.
+        let last = db.list_posts_page(t, Some(bob), 25, POSTS_PER_PAGE).unwrap();
+        db.mark_thread_read_upto(bob, t, last.last().unwrap().id).unwrap();
+        db.mark_thread_read_upto(bob, t, db.list_posts_page(t, Some(bob), 50, 100).unwrap().last().unwrap().id).unwrap();
+        assert_eq!(db.first_unread_index(bob, t).unwrap(), None);
+        assert_eq!(db.unread_thread_total(bob).unwrap(), 0);
     }
 
     #[test]

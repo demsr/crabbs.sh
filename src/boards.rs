@@ -4,9 +4,9 @@
 use std::sync::Arc;
 
 use crate::content;
-use crate::db::{DbError, MAX_POSTS_PER_THREAD, Role};
+use crate::db::{DbError, MAX_POSTS_PER_THREAD, POSTS_PER_PAGE, Role, THREADS_PER_PAGE};
 use crate::state::{Event, Identity, Shared, Subject};
-use crate::ui::{BoardInfo, PostInfo, Response, ThreadDetail, ThreadInfo};
+use crate::ui::{BoardInfo, PageTarget, PostInfo, Response, ThreadDetail, ThreadInfo};
 
 const INTERNAL_ERROR: &str = "Internal error, please try again later.";
 
@@ -37,26 +37,41 @@ pub async fn list_boards(shared: &Arc<Shared>, viewer: Option<i64>) -> Response 
     }
 }
 
+/// Number of pages for `total` items (an empty list still has one page).
+fn page_count(total: usize, per_page: usize) -> usize {
+    total.div_ceil(per_page).max(1)
+}
+
+/// Shows one page (0-based) of a board's threads. A page past the end is
+/// clamped, so stale requests (e.g. after deletions) land on the last page.
 pub async fn list_threads(
     shared: &Arc<Shared>,
     board_id: i64,
+    page: usize,
     notice: Option<String>,
     viewer: Option<i64>,
 ) -> Response {
     let result = shared
         .blocking(move |s| {
-            let name = s.db.board_name(board_id)?;
-            match name {
-                Some(name) => Ok(Some((name, s.db.list_threads(board_id, viewer)?))),
-                None => Ok(None),
-            }
+            let Some(name) = s.db.board_name(board_id)? else {
+                return Ok(None);
+            };
+            let total = s.db.count_threads(board_id)? as usize;
+            let pages = page_count(total, THREADS_PER_PAGE);
+            let page = page.min(pages - 1);
+            let threads =
+                s.db.list_threads(board_id, viewer, page * THREADS_PER_PAGE, THREADS_PER_PAGE)?;
+            Ok(Some((name, threads, page, pages, total)))
         })
         .await;
     match result {
-        Ok(Some((board_name, threads))) => Response::Threads {
+        Ok(Some((board_name, threads, page, pages, total))) => Response::Threads {
             board_id,
             notice,
             board_name,
+            page,
+            pages,
+            total,
             threads: threads
                 .into_iter()
                 .map(|t| ThreadInfo {
@@ -74,10 +89,12 @@ pub async fn list_threads(
     }
 }
 
+/// Shows one page of a thread. `target` picks the page (see `PageTarget`);
+/// a page past the end is clamped.
 pub async fn open_thread(
     shared: &Arc<Shared>,
     thread_id: i64,
-    to_end: bool,
+    target: PageTarget,
     notice: Option<String>,
     viewer: Option<i64>,
 ) -> Response {
@@ -86,23 +103,44 @@ pub async fn open_thread(
             let Some(head) = s.db.thread_head(thread_id)? else {
                 return Ok(None);
             };
+            let total = head.post_count.max(0) as usize;
+            let pages = page_count(total, POSTS_PER_PAGE);
+            let (page, to_end) = match target {
+                // The page holding the first unread post, else the start.
+                PageTarget::Smart => {
+                    let first_unread = match viewer {
+                        Some(user_id) => s.db.first_unread_index(user_id, thread_id)?,
+                        None => None,
+                    };
+                    (first_unread.map_or(0, |i| i as usize / POSTS_PER_PAGE), false)
+                }
+                PageTarget::Page(n) => (n, false),
+                PageTarget::PageEnd(n) => (n, true),
+                PageTarget::Last => (pages - 1, true),
+            };
+            let page = page.min(pages - 1);
             // Read the posts (with their unread flags) first, then advance
-            // the read pointer: what was new stays flagged on this screen.
-            let posts = s.db.list_posts(thread_id, viewer)?;
-            if let Some(user_id) = viewer {
-                s.db.mark_thread_read(user_id, thread_id)?;
+            // the read pointer only as far as this page: posts on pages the
+            // reader hasn't reached stay unread.
+            let posts =
+                s.db.list_posts_page(thread_id, viewer, page * POSTS_PER_PAGE, POSTS_PER_PAGE)?;
+            if let (Some(user_id), Some(last)) = (viewer, posts.last()) {
+                s.db.mark_thread_read_upto(user_id, thread_id, last.id)?;
             }
-            Ok(Some((head, posts)))
+            Ok(Some((head, posts, page, pages, total, to_end)))
         })
         .await;
     match result {
-        Ok(Some((head, posts))) => Response::Thread {
+        Ok(Some((head, posts, page, pages, total, to_end))) => Response::Thread {
             notice,
             detail: ThreadDetail {
                 id: head.id,
                 board_id: head.board_id,
                 board_name: head.board_name,
                 title: head.title,
+                page,
+                pages,
+                total,
                 posts: posts
                     .into_iter()
                     .map(|p| PostInfo {
@@ -205,7 +243,8 @@ pub async fn create_thread(
         .await
     {
         Ok(thread_id) => {
-            open_thread(shared, thread_id, true, Some("Posted.".into()), Some(user_id)).await
+            open_thread(shared, thread_id, PageTarget::Last, Some("Posted.".into()), Some(user_id))
+                .await
         }
         Err(err) => post_error(err, "board"),
     }
@@ -232,13 +271,20 @@ pub async fn reply(
         .await
     {
         Ok(()) => {
-            open_thread(shared, thread_id, true, Some("Posted.".into()), Some(user_id)).await
+            open_thread(shared, thread_id, PageTarget::Last, Some("Posted.".into()), Some(user_id))
+                .await
         }
         Err(err) => post_error(err, "thread"),
     }
 }
 
-pub async fn delete_thread(shared: &Arc<Shared>, identity: &Identity, thread_id: i64) -> Response {
+/// `page` is the list page to show afterwards.
+pub async fn delete_thread(
+    shared: &Arc<Shared>,
+    identity: &Identity,
+    thread_id: i64,
+    page: usize,
+) -> Response {
     if let Err(e) = require_sysop(shared, identity).await {
         return Response::Error(e);
     }
@@ -247,6 +293,7 @@ pub async fn delete_thread(shared: &Arc<Shared>, identity: &Identity, thread_id:
             list_threads(
                 shared,
                 board_id,
+                page,
                 Some("Thread deleted.".into()),
                 identity.user_id(),
             )
@@ -257,7 +304,13 @@ pub async fn delete_thread(shared: &Arc<Shared>, identity: &Identity, thread_id:
     }
 }
 
-pub async fn delete_post(shared: &Arc<Shared>, identity: &Identity, post_id: i64) -> Response {
+/// `page` is the thread page to stay on afterwards.
+pub async fn delete_post(
+    shared: &Arc<Shared>,
+    identity: &Identity,
+    post_id: i64,
+    page: usize,
+) -> Response {
     if let Err(e) = require_sysop(shared, identity).await {
         return Response::Error(e);
     }
@@ -266,6 +319,7 @@ pub async fn delete_post(shared: &Arc<Shared>, identity: &Identity, post_id: i64
             list_threads(
                 shared,
                 d.board_id,
+                0,
                 Some("Post deleted; the thread is gone too.".into()),
                 identity.user_id(),
             )
@@ -275,7 +329,7 @@ pub async fn delete_post(shared: &Arc<Shared>, identity: &Identity, post_id: i64
             open_thread(
                 shared,
                 d.thread_id,
-                false,
+                PageTarget::Page(page),
                 Some("Post deleted.".into()),
                 identity.user_id(),
             )
@@ -287,7 +341,12 @@ pub async fn delete_post(shared: &Arc<Shared>, identity: &Identity, post_id: i64
 }
 
 /// Marks every thread in the board as read, then shows the refreshed list.
-pub async fn mark_board_read(shared: &Arc<Shared>, identity: &Identity, board_id: i64) -> Response {
+pub async fn mark_board_read(
+    shared: &Arc<Shared>,
+    identity: &Identity,
+    board_id: i64,
+    page: usize,
+) -> Response {
     let Some(user_id) = identity.user_id() else {
         return Response::Error("Guests don't have read markers. Register an account first.".into());
     };
@@ -299,6 +358,7 @@ pub async fn mark_board_read(shared: &Arc<Shared>, identity: &Identity, board_id
             list_threads(
                 shared,
                 board_id,
+                page,
                 Some("Marked everything in this board as read.".into()),
                 Some(user_id),
             )

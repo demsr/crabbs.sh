@@ -36,6 +36,19 @@ use register::{FormEvent, RegisterForm};
 /// Cap on buffered, not-yet-processed keystrokes.
 const MAX_QUEUED_KEYS: usize = 4096;
 
+/// Which page of a thread to show.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PageTarget {
+    /// The page with the first unread post, or the first page.
+    Smart,
+    /// A specific page, shown from its top.
+    Page(usize),
+    /// A specific page, scrolled to its bottom (paging backwards).
+    PageEnd(usize),
+    /// The last page, scrolled to the bottom.
+    Last,
+}
+
 /// Work the UI needs the server to do (database, hashing, ...). The UI itself
 /// is synchronous; the SSH handler runs the request and feeds the answer back
 /// through `App::on_response`.
@@ -52,20 +65,27 @@ pub enum Request {
     /// Members only: mark every thread in the board as read.
     MarkBoardRead {
         board_id: i64,
+        /// Thread-list page to show afterwards.
+        page: usize,
     },
+    /// One page (0-based) of a board's thread list.
     ListThreads {
         board_id: i64,
+        page: usize,
     },
-    /// Sysop-only; the server checks.
+    /// Sysop-only; the server checks. `page` is the list page to return to.
     DeleteThread {
         thread_id: i64,
+        page: usize,
     },
-    /// Sysop-only; the server checks.
+    /// Sysop-only; the server checks. `page` is the thread page to stay on.
     DeletePost {
         post_id: i64,
+        page: usize,
     },
     OpenThread {
         thread_id: i64,
+        target: PageTarget,
     },
     /// `title` and `body` are already sanitised by the UI, and are
     /// sanitised again by the server.
@@ -131,6 +151,10 @@ pub enum Response {
         board_name: String,
         threads: Vec<ThreadInfo>,
         notice: Option<String>,
+        /// 0-based page shown, number of pages, threads on the whole board.
+        page: usize,
+        pages: usize,
+        total: usize,
     },
     /// `to_end` scrolls to the newest post (used after posting).
     Thread {
@@ -215,6 +239,10 @@ pub struct ThreadDetail {
     pub board_name: String,
     pub title: String,
     pub posts: Vec<PostInfo>,
+    /// 0-based page of the thread shown, number of pages, total posts.
+    pub page: usize,
+    pub pages: usize,
+    pub total: usize,
 }
 
 pub struct KeyInfo {
@@ -459,6 +487,9 @@ impl App {
                 board_name,
                 threads,
                 notice,
+                page,
+                pages,
+                total,
             } => {
                 // Replaces whatever is showing: this also answers a deleted
                 // post that took its whole thread with it.
@@ -467,7 +498,7 @@ impl App {
                     self.identity.is_sysop(),
                     self.identity.user_id().is_some(),
                 );
-                list.set(board_name, threads);
+                list.set(board_name, threads, page, pages, total);
                 self.screen = Screen::Threads(list);
                 if let Some(text) = notice {
                     self.set_status(text, false);
@@ -479,11 +510,17 @@ impl App {
                 notice,
             } => {
                 // Also arrives after a successful post, when the compose
-                // screen is still up; the thread replaces it.
+                // screen is still up; the thread replaces it. Moving between
+                // pages of the same thread keeps the list page we came from.
+                let list_page = match &self.screen {
+                    Screen::Thread(view) => view.list_page(),
+                    _ => 0,
+                };
                 self.screen = Screen::Thread(ThreadView::from_detail(
                     detail,
                     to_end,
                     self.identity.is_sysop(),
+                    list_page,
                 ));
                 if let Some(text) = notice {
                     self.set_status(text, false);
@@ -600,16 +637,20 @@ impl App {
                 }
                 BoardsEvent::Open(board_id) => {
                     self.screen = Screen::Threads(ThreadList::loading(board_id, sysop, member));
-                    Some(Action::Request(Request::ListThreads { board_id }))
+                    Some(Action::Request(Request::ListThreads { board_id, page: 0 }))
                 }
             },
             Screen::Threads(list) => match list.handle(key) {
                 ThreadsEvent::None => None,
-                ThreadsEvent::MarkBoardRead { board_id } => {
-                    Some(Action::Request(Request::MarkBoardRead { board_id }))
+                ThreadsEvent::MarkBoardRead { board_id, page } => {
+                    Some(Action::Request(Request::MarkBoardRead { board_id, page }))
                 }
-                ThreadsEvent::DeleteThread { thread_id } => {
-                    Some(Action::Request(Request::DeleteThread { thread_id }))
+                ThreadsEvent::DeleteThread { thread_id, page } => {
+                    Some(Action::Request(Request::DeleteThread { thread_id, page }))
+                }
+                // The list stays up until the requested page arrives.
+                ThreadsEvent::Page { board_id, page } => {
+                    Some(Action::Request(Request::ListThreads { board_id, page }))
                 }
                 ThreadsEvent::Back => {
                     self.screen = Screen::Boards(BoardList::new());
@@ -618,20 +659,36 @@ impl App {
                 ThreadsEvent::Open {
                     board_id,
                     thread_id,
+                    list_page,
                 } => {
-                    self.screen = Screen::Thread(ThreadView::loading(board_id, thread_id, sysop));
-                    Some(Action::Request(Request::OpenThread { thread_id }))
+                    self.screen = Screen::Thread(ThreadView::loading(
+                        board_id, thread_id, sysop, list_page,
+                    ));
+                    Some(Action::Request(Request::OpenThread {
+                        thread_id,
+                        target: PageTarget::Smart,
+                    }))
                 }
                 ThreadsEvent::New { board_id } => self.start_compose(Compose::new_thread(board_id)),
             },
             Screen::Thread(view) => match view.handle(key) {
                 ThreadEvent::None => None,
-                ThreadEvent::DeletePost { post_id } => {
-                    Some(Action::Request(Request::DeletePost { post_id }))
+                ThreadEvent::DeletePost { post_id, page } => {
+                    Some(Action::Request(Request::DeletePost { post_id, page }))
                 }
-                ThreadEvent::Back { board_id } => {
+                // The current page stays up until the new one arrives.
+                ThreadEvent::Goto { thread_id, target } => {
+                    Some(Action::Request(Request::OpenThread { thread_id, target }))
+                }
+                ThreadEvent::Back {
+                    board_id,
+                    list_page,
+                } => {
                     self.screen = Screen::Threads(ThreadList::loading(board_id, sysop, member));
-                    Some(Action::Request(Request::ListThreads { board_id }))
+                    Some(Action::Request(Request::ListThreads {
+                        board_id,
+                        page: list_page,
+                    }))
                 }
                 ThreadEvent::Reply { thread_id, title } => {
                     self.start_compose(Compose::reply(thread_id, &title))
