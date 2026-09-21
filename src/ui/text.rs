@@ -1,4 +1,23 @@
+use std::sync::atomic::{AtomicUsize, Ordering};
+
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+
+/// Interior-mutable counter with `Cell`'s API. Drawing only has `&self`, but
+/// needs to record layout results; unlike `Cell` this keeps `App` `Sync`,
+/// which the SSH handler's async methods require.
+pub struct Counter(AtomicUsize);
+
+impl Counter {
+    pub fn new(v: usize) -> Self {
+        Self(AtomicUsize::new(v))
+    }
+    pub fn get(&self) -> usize {
+        self.0.load(Ordering::Relaxed)
+    }
+    pub fn set(&self, v: usize) {
+        self.0.store(v, Ordering::Relaxed);
+    }
+}
 
 /// Word-wraps `text` to `width` display columns. Lines that already fit are
 /// returned untouched, so indentation and spacing (ASCII art, code) survive.

@@ -124,7 +124,7 @@ pub async fn open_thread(
 
 /// Reads the user's current account state; roles and bans can be changed at
 /// any time by the admin tool, so this is never taken from the session.
-async fn live_account(shared: &Arc<Shared>, identity: &Identity) -> Result<crate::db::Account, String> {
+pub(crate) async fn live_account(shared: &Arc<Shared>, identity: &Identity) -> Result<crate::db::Account, String> {
     let Identity::User { id, .. } = identity else {
         return Err("Guests can't do that. Register an account first.".into());
     };

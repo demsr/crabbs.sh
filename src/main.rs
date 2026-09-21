@@ -10,6 +10,7 @@ use tokio::sync::Semaphore;
 
 use rust_bbs::db::Db;
 use rust_bbs::server::BbsServer;
+use rust_bbs::chat::ChatRoom;
 use rust_bbs::state::{Limiter, Online, Shared};
 use rust_bbs::auth;
 
@@ -47,6 +48,7 @@ async fn main() -> anyhow::Result<()> {
         hash_slots: Semaphore::new(MAX_CONCURRENT_HASHES),
         limiter: Arc::new(Limiter::default()),
         online: Arc::new(Online::default()),
+        chat: Arc::new(ChatRoom::new()),
         dummy_hash,
     });
 

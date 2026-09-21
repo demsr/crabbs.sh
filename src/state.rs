@@ -8,6 +8,7 @@ use russh::server::Handle;
 use tokio::sync::Semaphore;
 
 pub use crate::db::Role;
+use crate::chat::ChatRoom;
 use crate::db::Db;
 
 /// Who a session is acting as. This is BBS-level identity, separate from the
@@ -51,6 +52,7 @@ pub struct Shared {
     pub hash_slots: Semaphore,
     pub limiter: Arc<Limiter>,
     pub online: Arc<Online>,
+    pub chat: Arc<ChatRoom>,
     /// Verified against when a username doesn't exist, so unknown and known
     /// users take equally long to reject.
     pub dummy_hash: String,
@@ -77,6 +79,7 @@ pub enum Event {
     /// Any new post, including the first post of a new thread.
     Post,
     NewThread,
+    ChatMessage,
 }
 
 impl Event {
@@ -86,6 +89,7 @@ impl Event {
             Event::Registration => (3, Duration::from_secs(60 * 60)),
             Event::Post => (10, Duration::from_secs(10 * 60)),
             Event::NewThread => (3, Duration::from_secs(60 * 60)),
+            Event::ChatMessage => (8, Duration::from_secs(10)),
         }
     }
 }

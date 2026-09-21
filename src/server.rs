@@ -1,5 +1,5 @@
 use std::net::IpAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use anyhow::bail;
 use ratatui::Terminal;
@@ -8,7 +8,10 @@ use ratatui::layout::Rect;
 use russh::keys::PublicKey;
 use russh::server::{Auth, ChannelOpenHandle, Handler, Msg, Server as ServerTrait, Session};
 use russh::{Channel, ChannelId, Pty};
+use tokio::sync::broadcast::error::RecvError;
+use tokio::task::JoinHandle;
 
+use crate::chat::ChatRoom;
 use crate::db::{DbError, MAX_KEYS_PER_USER};
 use russh::Disconnect;
 use crate::state::{
@@ -16,9 +19,54 @@ use crate::state::{
 };
 use crate::terminal::TerminalHandle;
 use crate::ui::{Action, App, KeyInfo, OnlineInfo, Request, Response};
-use crate::{auth, boards};
+use crate::{auth, boards, content};
 
 type SshTerminal = Terminal<CrosstermBackend<TerminalHandle>>;
+
+/// The screen state of one session. It is shared with the session's chat
+/// listener task (which redraws when chat events arrive), so it sits behind a
+/// mutex that is only ever held for short synchronous sections - never across
+/// an `.await`.
+struct Ui {
+    terminal: Option<SshTerminal>,
+    app: Option<App>,
+}
+
+impl Ui {
+    fn redraw(&mut self) {
+        if let (Some(terminal), Some(app)) = (self.terminal.as_mut(), self.app.as_ref()) {
+            let _ = terminal.draw(|frame| app.draw(frame));
+        }
+    }
+}
+
+type SharedUi = Arc<Mutex<Ui>>;
+
+fn lock_ui(ui: &SharedUi) -> MutexGuard<'_, Ui> {
+    ui.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Takes the session out of the chat room when the connection ends,
+/// however it ends.
+struct ChatSeat {
+    room: Arc<ChatRoom>,
+    id: u64,
+}
+
+impl Drop for ChatSeat {
+    fn drop(&mut self) {
+        self.room.leave(self.id);
+    }
+}
+
+/// Stops a background task when its session ends.
+struct AbortOnDrop(JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
 
 const GUEST_USER: &str = "guest";
 /// Sanity bounds so absurd credentials are rejected before any real work.
@@ -45,7 +93,14 @@ impl ServerTrait for BbsServer {
     fn new_client(&mut self, peer_addr: Option<std::net::SocketAddr>) -> BbsHandler {
         let peer_ip = peer_addr.map(|addr| addr.ip());
         let guard = peer_ip.and_then(|ip| self.shared.limiter.connect(ip));
+        let chat_id = self.shared.chat.new_id();
         BbsHandler {
+            chat_id,
+            _chat_seat: ChatSeat {
+                room: Arc::clone(&self.shared.chat),
+                id: chat_id,
+            },
+            _chat_task: None,
             shared: Arc::clone(&self.shared),
             peer_ip,
             over_limit: peer_ip.is_some() && guard.is_none(),
@@ -53,8 +108,10 @@ impl ServerTrait for BbsServer {
             identity: None,
             online: None,
             output: None,
-            terminal: None,
-            app: None,
+            ui: Arc::new(Mutex::new(Ui {
+                terminal: None,
+                app: None,
+            })),
         }
     }
 
@@ -77,15 +134,47 @@ pub struct BbsHandler {
     online: Option<OnlineGuard>,
     /// Where the UI is drawn: the client's SSH channel.
     output: Option<TerminalHandle>,
-    terminal: Option<SshTerminal>,
-    app: Option<App>,
+    ui: SharedUi,
+    /// This session's id in the chat room.
+    chat_id: u64,
+    _chat_seat: ChatSeat,
+    /// Listens to the room and redraws this session on new events.
+    _chat_task: Option<AbortOnDrop>,
 }
 
 impl BbsHandler {
-    fn redraw(&mut self) {
-        if let (Some(terminal), Some(app)) = (self.terminal.as_mut(), self.app.as_ref()) {
-            let _ = terminal.draw(|frame| app.draw(frame));
-        }
+    fn redraw(&self) {
+        lock_ui(&self.ui).redraw();
+    }
+
+    /// Starts the task that turns chat-room events into redraws. It runs for
+    /// the whole session; the screen ignores events unless chat is open.
+    fn spawn_chat_listener(&mut self) {
+        let ui = Arc::clone(&self.ui);
+        let room = Arc::clone(&self.shared.chat);
+        let mut events = room.subscribe();
+        let task = tokio::spawn(async move {
+            loop {
+                match events.recv().await {
+                    Ok(event) => {
+                        let mut ui = lock_ui(&ui);
+                        if ui.app.as_mut().is_some_and(|app| app.on_chat_event(event)) {
+                            ui.redraw();
+                        }
+                    }
+                    // Fell too far behind: start over from a fresh snapshot.
+                    Err(RecvError::Lagged(_)) => {
+                        let snapshot = room.snapshot();
+                        let mut ui = lock_ui(&ui);
+                        if ui.app.as_mut().is_some_and(|app| app.on_chat_snapshot(snapshot)) {
+                            ui.redraw();
+                        }
+                    }
+                    Err(RecvError::Closed) => break,
+                }
+            }
+        });
+        self._chat_task = Some(AbortOnDrop(task));
     }
 
     fn auth_throttled(&self) -> bool {
@@ -188,6 +277,12 @@ impl BbsHandler {
                 None => Response::Error(INTERNAL_ERROR.into()),
             },
             Request::WhoIsOnline => self.who_is_online(),
+            Request::JoinChat => self.join_chat().await,
+            Request::LeaveChat => {
+                self.shared.chat.leave(self.chat_id);
+                Response::Nothing
+            }
+            Request::ChatSay { text, action } => self.chat_say(text, action).await,
             Request::DeleteThread { thread_id } => match &self.identity {
                 Some(identity) => boards::delete_thread(&self.shared, identity, thread_id).await,
                 None => Response::Error(INTERNAL_ERROR.into()),
@@ -228,6 +323,47 @@ impl BbsHandler {
                 self.keys_response(Some(notice)).await
             }
         }
+    }
+
+    async fn join_chat(&self) -> Response {
+        let Some(identity @ Identity::User { .. }) = &self.identity else {
+            return Response::ChatRejected("The chat is for registered users.".into());
+        };
+        // Name and role come from the database, not from the login session.
+        match boards::live_account(&self.shared, identity).await {
+            Ok(account) => Response::ChatJoined(self.shared.chat.join(
+                self.chat_id,
+                &account.username,
+                account.role == Role::Sysop,
+            )),
+            Err(message) => Response::ChatRejected(message),
+        }
+    }
+
+    async fn chat_say(&self, text: String, action: bool) -> Response {
+        let Some(identity) = &self.identity else {
+            return Response::ChatRejected(INTERNAL_ERROR.into());
+        };
+        let account = match boards::live_account(&self.shared, identity).await {
+            Ok(account) => account,
+            Err(message) => return Response::ChatRejected(message),
+        };
+        if !self.shared.chat.is_member(self.chat_id) {
+            return Response::ChatRejected("You're not in the chat room.".into());
+        }
+        let subject = Subject::User(account.id);
+        if !self.shared.limiter.allowed(subject, Event::ChatMessage) {
+            return Response::ChatRejected("Slow down a little.".into());
+        }
+        let text = match content::clean_chat(&text) {
+            Ok(text) => text,
+            Err(message) => return Response::ChatRejected(message),
+        };
+        self.shared.limiter.record(subject, Event::ChatMessage);
+        self.shared
+            .chat
+            .say(&account.username, account.role == Role::Sysop, &text, action);
+        Response::Nothing
     }
 
     fn who_is_online(&self) -> Response {
@@ -276,12 +412,12 @@ impl BbsHandler {
 
     /// Keeps the registry entry in step with the session's identity and screen.
     fn sync_online(&self) {
-        let (Some(guard), Some(identity), Some(app)) =
-            (&self.online, &self.identity, &self.app)
-        else {
+        let (Some(guard), Some(identity)) = (&self.online, &self.identity) else {
             return;
         };
-        let activity = app.activity();
+        let Some(activity) = lock_ui(&self.ui).app.as_ref().map(|app| app.activity()) else {
+            return;
+        };
         let (name, user_id, role) = match identity {
             Identity::Guest => ("guest".to_string(), None, Role::User),
             Identity::User { id, name, role } => (name.clone(), Some(*id), *role),
@@ -471,21 +607,23 @@ impl Handler for BbsHandler {
         let Some(identity) = self.identity.clone() else {
             return Ok(());
         };
-        if self.terminal.is_some() {
+        if lock_ui(&self.ui).terminal.is_some() {
             return Ok(());
         }
 
         self.output = Some(TerminalHandle::start(session.handle(), channel.id()).await);
         // The real size arrives with the client's pty request; start at zero.
-        self.terminal = Some(self.new_terminal(Rect::default())?);
+        let terminal = self.new_terminal(Rect::default())?;
+        lock_ui(&self.ui).terminal = Some(terminal);
         let unread = match identity.user_id() {
             Some(id) => boards::unread_total(&self.shared, id).await,
             None => 0,
         };
         let mut app = App::new(identity);
         app.set_unread_threads(unread);
-        self.app = Some(app);
+        lock_ui(&self.ui).app = Some(app);
         self.join_online(session.handle());
+        self.spawn_chat_listener();
 
         reply.accept().await;
         Ok(())
@@ -560,13 +698,20 @@ impl Handler for BbsHandler {
         data: &[u8],
         session: &mut Session,
     ) -> Result<(), Self::Error> {
-        let Some(app) = self.app.as_mut() else {
-            return Ok(());
-        };
-        app.push_input(data);
+        {
+            let mut ui = lock_ui(&self.ui);
+            let Some(app) = ui.app.as_mut() else {
+                return Ok(());
+            };
+            app.push_input(data);
+        }
 
         loop {
-            let Some(action) = self.app.as_mut().and_then(App::pump) else {
+            let action = {
+                let mut ui = lock_ui(&self.ui);
+                ui.app.as_mut().and_then(App::pump)
+            };
+            let Some(action) = action else {
                 break;
             };
             match action {
@@ -581,7 +726,7 @@ impl Handler for BbsHandler {
                     self.sync_online();
                     self.redraw();
                     let response = self.serve(request).await;
-                    if let Some(app) = self.app.as_mut() {
+                    if let Some(app) = lock_ui(&self.ui).app.as_mut() {
                         app.on_response(response);
                     }
                 }
@@ -617,14 +762,16 @@ impl BbsHandler {
     }
 
     fn resize(&mut self, cols: u32, rows: u32) -> anyhow::Result<()> {
-        if self.terminal.is_some() {
+        let has_terminal = lock_ui(&self.ui).terminal.is_some();
+        if has_terminal {
             let area = Rect {
                 x: 0,
                 y: 0,
                 width: cols.clamp(1, MAX_TERMINAL_DIM) as u16,
                 height: rows.clamp(1, MAX_TERMINAL_DIM) as u16,
             };
-            self.terminal = Some(self.new_terminal(area)?);
+            let terminal = self.new_terminal(area)?;
+            lock_ui(&self.ui).terminal = Some(terminal);
         }
         Ok(())
     }

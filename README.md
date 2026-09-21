@@ -87,10 +87,37 @@ registered counts as read. Guests have no markers. State lives in the
 automatically in existing databases; for existing users, everything posted
 since they registered shows as unread once.
 
+## Chat
+
+Main menu → **Chat** is one public room, live: what people type appears on
+everyone else's screen immediately, without them pressing anything. The
+right-hand panel shows who is in the room (hidden on terminals narrower than
+60 columns), and the log shows joins, leaves, messages and `/me` actions.
+Times are UTC.
+
+- Enter sends, Esc (or `/quit`) leaves; PgUp/PgDn or ↑/↓ scroll back, End
+  jumps to the newest line. While scrolled back the view stays put when new
+  lines arrive.
+- `/me <action>`, `/who`, `/help`. Commands and errors like "Slow down" are
+  shown only to you.
+- Only registered users can join; guests are told to register first.
+- New arrivals see the last 100 events. History lives in memory only, so it
+  is empty after a server restart.
+- Messages are single lines of up to 300 characters, cleaned of control and
+  bidi/zero-width characters on the server, and limited to 8 per 10 seconds
+  per user. A suspended user can't speak (and is disconnected shortly after).
+- Someone connected twice is listed once and announced once.
+
+How it works: the room (`src/chat.rs`) numbers every event and broadcasts it;
+each session has a small listener task that redraws its screen when an event
+arrives. A joining session gets a snapshot stamped with a sequence number and
+ignores older broadcast events, so nothing is shown twice or lost, and a
+listener that falls too far behind resynchronises from a fresh snapshot.
+
 ## Who's online
 
 Main menu → **Who's online** lists the registered users currently connected,
-what each is doing (main menu, reading a thread, writing a post, ...) and
+what each is doing (main menu, reading a thread, writing a post, chatting, ...) and
 for how long, with a `[sysop]` badge for sysops. Guests are only counted, not
 named. `r` refreshes the snapshot.
 
@@ -145,6 +172,8 @@ account from the database, so a demotion or ban takes effect at once.
   connections, 10 failed logins per 10 minutes, 3 registrations per hour.
   Behind a reverse proxy / NAT all users share one address, so tune
   `src/state.rs` accordingly.
+- Chat is registered-users only, rate limited per user, sanitised on the
+  server, and checks for suspension on every message.
 - Only `password` and `publickey` authentication are offered. Exec,
   subsystem (sftp) and port-forwarding requests are refused.
 - Bans and roles are enforced from the database on every action, not from
@@ -176,7 +205,9 @@ account from the database, so a demotion or ban takes effect at once.
   admin tool uses
 - `src/boards.rs` — board requests: permission checks, validation, rate
   limiting; calls into `db.rs`
-- `src/content.rs` — sanitising and limits for titles and post bodies
+- `src/chat.rs` — the chat room: membership, history, sequenced broadcast
+- `src/content.rs` — sanitising and limits for titles, post bodies and chat
+  lines
 - `src/auth.rs` — username/password validation, Argon2, public-key parsing
 - `src/terminal.rs` — adapts an SSH channel into an `io::Write` sink
 - `src/ui/` — the terminal UI. `App` in `mod.rs` is a small screen state
@@ -184,8 +215,8 @@ account from the database, so a demotion or ban takes effect at once.
   returning a `Request`, then receives a `Response`. `input.rs` parses raw
   bytes into keys and has the text-field widget; `register.rs` and
   `keys.rs`, `boards.rs` (board list, thread list, thread view),
-  `compose.rs` (multi-line editor and compose screen) and `online.rs` are
-  screens.
+  `compose.rs` (multi-line editor and compose screen), `online.rs` and
+  `chat.rs` (the chat screen) are screens.
 
 ### Adding a screen
 
@@ -193,9 +224,12 @@ account from the database, so a demotion or ban takes effect at once.
 2. Give it `handle(Key) -> Event` and `draw(frame, area)` methods.
 3. If it needs the database, add a `Request`/`Response` pair and handle the
    request in `BbsHandler::serve`.
+4. If it needs to update while the user is idle (like chat), the session's
+   screen state is shared with a background task through a mutex in
+   `server.rs`; never hold that lock across an `.await`.
 
 ## Next steps
 
 - Thread/post pagination beyond the current caps
-- Live chat between online users
-- Self-service password change; private messages
+- Chat rooms/channels, private messages between users
+- Self-service password change

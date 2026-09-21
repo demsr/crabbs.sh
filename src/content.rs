@@ -6,6 +6,7 @@
 pub const TITLE_MIN: usize = 3;
 pub const TITLE_MAX: usize = 80;
 pub const BODY_MAX: usize = 2000;
+pub const CHAT_MAX: usize = 300;
 /// Column at which the post editor word-wraps: the widest a line can be and
 /// still fit inside the borders of an 80-column terminal, so full-width
 /// ASCII art survives intact.
@@ -89,6 +90,26 @@ pub fn clean_body(raw: &str) -> Result<String, String> {
     Ok(body)
 }
 
+/// One line of chat: control characters become spaces, whitespace is
+/// collapsed, and it must be non-empty and at most `CHAT_MAX` characters.
+pub fn clean_chat(raw: &str) -> Result<String, String> {
+    let text = raw
+        .chars()
+        .filter(|&c| !is_deceptive(c))
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if text.is_empty() {
+        return Err("Nothing to send.".into());
+    }
+    if text.chars().count() > CHAT_MAX {
+        return Err(format!("Chat messages can be at most {CHAT_MAX} characters."));
+    }
+    Ok(text)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -124,5 +145,13 @@ mod tests {
         assert_eq!(clean_body("\n\n    x\n").unwrap(), "    x");
         // tabs are expanded, not collapsed to one space
         assert_eq!(clean_body("\tx").unwrap(), "    x");
+    }
+
+    #[test]
+    fn chat_lines_are_cleaned() {
+        assert_eq!(clean_chat("  hi \t there\x1b[2J ").unwrap(), "hi there [2J");
+        assert!(clean_chat("  \t ").is_err());
+        assert!(clean_chat(&"x".repeat(CHAT_MAX + 1)).is_err());
+        assert_eq!(clean_chat("a\u{202E}b").unwrap(), "ab");
     }
 }

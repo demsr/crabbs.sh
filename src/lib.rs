@@ -5,6 +5,7 @@
 
 pub mod auth;
 pub mod boards;
+pub mod chat;
 pub mod content;
 pub mod db;
 pub mod server;

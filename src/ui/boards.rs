@@ -1,5 +1,3 @@
-use std::sync::atomic::{AtomicUsize, Ordering};
-
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -7,25 +5,8 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
 
 use super::input::Key;
-use super::text::wrap;
+use super::text::{Counter, wrap};
 use super::{BoardInfo, ThreadDetail, ThreadInfo};
-
-/// Interior-mutable counter with `Cell`'s API. Drawing only has `&self`, but
-/// needs to record layout results; unlike `Cell` this keeps `App` `Sync`,
-/// which the SSH handler's async methods require.
-struct Counter(AtomicUsize);
-
-impl Counter {
-    fn new(v: usize) -> Self {
-        Self(AtomicUsize::new(v))
-    }
-    fn get(&self) -> usize {
-        self.0.load(Ordering::Relaxed)
-    }
-    fn set(&self, v: usize) {
-        self.0.store(v, Ordering::Relaxed);
-    }
-}
 
 const HIGHLIGHT: Style = Style::new()
     .bg(Color::Blue)

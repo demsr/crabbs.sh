@@ -1,4 +1,5 @@
 mod boards;
+mod chat;
 mod compose;
 mod input;
 mod keys;
@@ -13,8 +14,10 @@ use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap};
 
+use crate::chat::{ChatEvent, ChatSnapshot};
 use crate::state::Identity;
 use boards::{BoardList, BoardsEvent, ThreadEvent, ThreadList, ThreadView, ThreadsEvent};
+use chat::{ChatAction, ChatScreen};
 use compose::{Compose, ComposeEvent};
 use input::{Key, KeyParser};
 use keys::{KeysEvent, KeysScreen};
@@ -66,6 +69,15 @@ pub enum Request {
         thread_id: i64,
         body: String,
     },
+    /// Members only: enter the chat room. Answered with a snapshot.
+    JoinChat,
+    LeaveChat,
+    /// `action` is a `/me` line. The message itself comes back through the
+    /// room's broadcast like everyone else's.
+    ChatSay {
+        text: String,
+        action: bool,
+    },
 }
 
 pub enum Response {
@@ -92,6 +104,11 @@ pub enum Response {
         users: Vec<OnlineInfo>,
         guests: usize,
     },
+    ChatJoined(ChatSnapshot),
+    /// A chat message was refused (rate limit, suspended, ...).
+    ChatRejected(String),
+    /// The request needs no visible answer.
+    Nothing,
     /// A post was rejected; the compose screen stays open.
     PostFailed(String),
     /// Something couldn't be loaded.
@@ -157,6 +174,7 @@ pub enum Action {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum MenuItem {
     Board,
+    Chat,
     Online,
     Register,
     Keys,
@@ -171,6 +189,7 @@ impl MenuItem {
         }
         match self {
             MenuItem::Board => "Message boards",
+            MenuItem::Chat => "Chat",
             MenuItem::Online => "Who's online",
             MenuItem::Register => "Register an account",
             MenuItem::Keys => "SSH keys",
@@ -191,6 +210,7 @@ enum Screen {
     Thread(ThreadView),
     Compose(Box<ComposeScreen>),
     Online(OnlineScreen),
+    Chat(ChatScreen),
 }
 
 /// The compose screen remembers what to return to if it's cancelled.
@@ -246,6 +266,27 @@ impl App {
             Screen::Thread(_) => "Reading a thread",
             Screen::Compose(_) => "Writing a post",
             Screen::Online(_) => "Checking who's online",
+            Screen::Chat(_) => "Chatting",
+        }
+    }
+
+    /// A live event from the chat room. Returns whether the screen changed
+    /// (and so needs redrawing). Ignored unless the chat screen is open.
+    pub fn on_chat_event(&mut self, event: ChatEvent) -> bool {
+        match &mut self.screen {
+            Screen::Chat(chat) => chat.on_event(event),
+            _ => false,
+        }
+    }
+
+    /// A fresh snapshot after the listener fell behind.
+    pub fn on_chat_snapshot(&mut self, snapshot: ChatSnapshot) -> bool {
+        match &mut self.screen {
+            Screen::Chat(chat) => {
+                chat.set_snapshot(snapshot);
+                true
+            }
+            _ => false,
         }
     }
 
@@ -256,6 +297,7 @@ impl App {
         };
         vec![
             MenuItem::Board,
+            MenuItem::Chat,
             MenuItem::Online,
             account_item,
             MenuItem::About,
@@ -351,6 +393,17 @@ impl App {
                     screen.set(users, guests);
                 }
             }
+            Response::ChatJoined(snapshot) => {
+                if let Screen::Chat(chat) = &mut self.screen {
+                    chat.set_snapshot(snapshot);
+                }
+            }
+            Response::ChatRejected(message) => {
+                if let Screen::Chat(chat) = &mut self.screen {
+                    chat.add_system(message);
+                }
+            }
+            Response::Nothing => {}
             Response::PostFailed(message) => {
                 if let Screen::Compose(screen) = &mut self.screen {
                     screen.compose.fail(message);
@@ -455,6 +508,16 @@ impl App {
                 }
                 ComposeEvent::Submit(request) => Some(Action::Request(request)),
             },
+            Screen::Chat(chat) => match chat.handle(key) {
+                ChatAction::None => None,
+                ChatAction::Leave => {
+                    self.screen = Screen::Menu;
+                    Some(Action::Request(Request::LeaveChat))
+                }
+                ChatAction::Say { text, action } => {
+                    Some(Action::Request(Request::ChatSay { text, action }))
+                }
+            },
             Screen::Online(screen) => match screen.handle(key) {
                 OnlineEvent::None => None,
                 OnlineEvent::Back => {
@@ -515,6 +578,17 @@ impl App {
                 self.screen = Screen::Boards(BoardList::new());
                 return Some(Action::Request(Request::ListBoards));
             }
+            MenuItem::Chat => {
+                if matches!(self.identity, Identity::Guest) {
+                    self.set_status(
+                        "The chat is for registered users. Register an account first.",
+                        true,
+                    );
+                } else {
+                    self.screen = Screen::Chat(ChatScreen::new(self.identity.display_name()));
+                    return Some(Action::Request(Request::JoinChat));
+                }
+            }
             MenuItem::Online => {
                 self.screen = Screen::Online(OnlineScreen::new());
                 return Some(Action::Request(Request::WhoIsOnline));
@@ -552,6 +626,7 @@ impl App {
             Screen::Thread(view) => view.draw(frame, body),
             Screen::Compose(screen) => screen.compose.draw(frame, body),
             Screen::Online(screen) => screen.draw(frame, body),
+            Screen::Chat(chat) => chat.draw(frame, body),
         }
         self.draw_status(frame, chunks[2]);
     }
