@@ -7,6 +7,7 @@ pub const TITLE_MIN: usize = 3;
 pub const TITLE_MAX: usize = 80;
 pub const BODY_MAX: usize = 2000;
 pub const CHAT_MAX: usize = 300;
+pub const SUBJECT_MAX: usize = 80;
 /// Column at which the post editor word-wraps: the widest a line can be and
 /// still fit inside the borders of an 80-column terminal, so full-width
 /// ASCII art survives intact.
@@ -90,6 +91,25 @@ pub fn clean_body(raw: &str) -> Result<String, String> {
     Ok(body)
 }
 
+/// A mail subject: like a title, but a single character is enough.
+pub fn clean_subject(raw: &str) -> Result<String, String> {
+    let subject = raw
+        .chars()
+        .filter(|&c| !is_deceptive(c))
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if subject.is_empty() {
+        return Err("Please give the message a subject.".into());
+    }
+    if subject.chars().count() > SUBJECT_MAX {
+        return Err(format!("The subject can be at most {SUBJECT_MAX} characters."));
+    }
+    Ok(subject)
+}
+
 /// One line of chat: control characters become spaces, whitespace is
 /// collapsed, and it must be non-empty and at most `CHAT_MAX` characters.
 pub fn clean_chat(raw: &str) -> Result<String, String> {
@@ -145,6 +165,14 @@ mod tests {
         assert_eq!(clean_body("\n\n    x\n").unwrap(), "    x");
         // tabs are expanded, not collapsed to one space
         assert_eq!(clean_body("\tx").unwrap(), "    x");
+    }
+
+    #[test]
+    fn subjects_are_single_line_and_bounded() {
+        assert_eq!(clean_subject("  Hi\tthere \x1b").unwrap(), "Hi there");
+        assert_eq!(clean_subject("x").unwrap(), "x");
+        assert!(clean_subject("   ").is_err());
+        assert!(clean_subject(&"x".repeat(SUBJECT_MAX + 1)).is_err());
     }
 
     #[test]

@@ -63,6 +63,31 @@ CREATE TABLE IF NOT EXISTS thread_reads (
     last_read_post_id INTEGER NOT NULL,
     PRIMARY KEY (user_id, thread_id)
 );
+
+-- Private mail. Each side deletes its own copy; the row is purged once both
+-- have. read_at is when the recipient first opened it.
+CREATE TABLE IF NOT EXISTS messages (
+    id                INTEGER PRIMARY KEY,
+    sender_id         INTEGER NOT NULL REFERENCES users(id),
+    recipient_id      INTEGER NOT NULL REFERENCES users(id),
+    subject           TEXT NOT NULL,
+    body              TEXT NOT NULL,
+    created_at        INTEGER NOT NULL DEFAULT (unixepoch()),
+    read_at           INTEGER,
+    sender_deleted    INTEGER NOT NULL DEFAULT 0,
+    recipient_deleted INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE INDEX IF NOT EXISTS messages_recipient ON messages(recipient_id, recipient_deleted, id);
+CREATE INDEX IF NOT EXISTS messages_sender ON messages(sender_id, sender_deleted, id);
+
+-- user_id refuses mail from blocked_id.
+CREATE TABLE IF NOT EXISTS blocks (
+    user_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    blocked_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+    PRIMARY KEY (user_id, blocked_id)
+);
 ";
 
 /// Created on first start, when there are no boards at all.
@@ -89,6 +114,12 @@ fn viewer_id(viewer: Option<i64>) -> i64 {
 
 pub const MAX_THREADS_LISTED: usize = 100;
 pub const MAX_POSTS_PER_THREAD: usize = 200;
+/// Messages kept per user in each folder (inbox, sent).
+pub const MAX_MAILBOX: usize = 200;
+/// At most this many messages from one person to another per window, so a
+/// single sender can't flood a single recipient.
+const MAIL_PAIR_MAX: i64 = 5;
+const MAIL_PAIR_WINDOW_SECS: i64 = 10 * 60;
 const TIME_FORMAT: &str = "%Y-%m-%d %H:%M";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -155,6 +186,49 @@ pub struct UserSummary {
     pub created: String,
     pub posts: i64,
     pub keys: i64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Folder {
+    Inbox,
+    Sent,
+}
+
+pub struct MailItem {
+    pub id: i64,
+    /// The sender in the inbox, the recipient in the sent folder.
+    pub other: String,
+    pub subject: String,
+    pub created: String,
+    pub unread: bool,
+}
+
+pub struct MailMessage {
+    pub id: i64,
+    pub from: String,
+    pub to: String,
+    pub subject: String,
+    pub body: String,
+    pub created: String,
+    /// The reader is the recipient (as opposed to looking at their sent copy).
+    pub is_recipient: bool,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum MailError {
+    /// The recipient has blocked the sender.
+    Blocked,
+    RecipientFull,
+    SentFull,
+    /// Too many messages to this recipient recently.
+    TooFast,
+    Db(DbError),
+}
+
+impl From<rusqlite::Error> for MailError {
+    fn from(err: rusqlite::Error) -> Self {
+        MailError::Db(DbError::from(err))
+    }
 }
 
 pub struct Stats {
@@ -854,6 +928,214 @@ impl Db {
             },
         )?)
     }
+
+    // ---------------------------------------------------------------- mail
+
+    /// Delivers a message, enforcing blocks, mailbox sizes and the
+    /// per-recipient rate in one transaction. Returns the message id.
+    pub fn send_message(
+        &self,
+        sender: i64,
+        recipient: i64,
+        subject: &str,
+        body: &str,
+    ) -> Result<i64, MailError> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        let count = |sql: &str, params: &[&dyn rusqlite::ToSql]| -> rusqlite::Result<i64> {
+            tx.query_row(sql, params, |r| r.get(0))
+        };
+
+        if sender != recipient
+            && count(
+                "SELECT COUNT(*) FROM blocks WHERE user_id = ?1 AND blocked_id = ?2",
+                &[&recipient, &sender],
+            )? > 0
+        {
+            return Err(MailError::Blocked);
+        }
+        if count(
+            "SELECT COUNT(*) FROM messages WHERE recipient_id = ?1 AND recipient_deleted = 0",
+            &[&recipient],
+        )? >= MAX_MAILBOX as i64
+        {
+            return Err(MailError::RecipientFull);
+        }
+        if count(
+            "SELECT COUNT(*) FROM messages WHERE sender_id = ?1 AND sender_deleted = 0",
+            &[&sender],
+        )? >= MAX_MAILBOX as i64
+        {
+            return Err(MailError::SentFull);
+        }
+        if count(
+            "SELECT COUNT(*) FROM messages
+             WHERE sender_id = ?1 AND recipient_id = ?2 AND created_at >= unixepoch() - ?3",
+            &[&sender, &recipient, &MAIL_PAIR_WINDOW_SECS],
+        )? >= MAIL_PAIR_MAX
+        {
+            return Err(MailError::TooFast);
+        }
+
+        tx.execute(
+            "INSERT INTO messages (sender_id, recipient_id, subject, body) VALUES (?1, ?2, ?3, ?4)",
+            params![sender, recipient, subject, body],
+        )?;
+        let id = tx.last_insert_rowid();
+        tx.commit()?;
+        Ok(id)
+    }
+
+    /// Newest first, at most `MAX_MAILBOX`.
+    pub fn list_folder(&self, user_id: i64, folder: Folder) -> Result<Vec<MailItem>, DbError> {
+        let sql = match folder {
+            Folder::Inbox => format!(
+                "SELECT m.id, u.username, m.subject,
+                        strftime('{TIME_FORMAT}', m.created_at, 'unixepoch'), m.read_at IS NULL
+                 FROM messages m JOIN users u ON u.id = m.sender_id
+                 WHERE m.recipient_id = ?1 AND m.recipient_deleted = 0
+                 ORDER BY m.id DESC LIMIT ?2"
+            ),
+            Folder::Sent => format!(
+                "SELECT m.id, u.username, m.subject,
+                        strftime('{TIME_FORMAT}', m.created_at, 'unixepoch'), 0
+                 FROM messages m JOIN users u ON u.id = m.recipient_id
+                 WHERE m.sender_id = ?1 AND m.sender_deleted = 0
+                 ORDER BY m.id DESC LIMIT ?2"
+            ),
+        };
+        let conn = self.conn();
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(params![user_id, MAX_MAILBOX as i64], |row| {
+            Ok(MailItem {
+                id: row.get(0)?,
+                other: row.get(1)?,
+                subject: row.get(2)?,
+                created: row.get(3)?,
+                unread: row.get(4)?,
+            })
+        })?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// Fetches a message the user is a party to (and hasn't deleted), and
+    /// marks it read if they are the recipient.
+    pub fn read_message(&self, user_id: i64, message_id: i64) -> Result<Option<MailMessage>, DbError> {
+        let conn = self.conn();
+        let found = conn
+            .query_row(
+                &format!(
+                    "SELECT s.username, r.username, m.subject, m.body,
+                            strftime('{TIME_FORMAT}', m.created_at, 'unixepoch'),
+                            m.sender_id, m.recipient_id, m.sender_deleted, m.recipient_deleted
+                     FROM messages m
+                     JOIN users s ON s.id = m.sender_id
+                     JOIN users r ON r.id = m.recipient_id
+                     WHERE m.id = ?1"
+                ),
+                params![message_id],
+                |row| {
+                    Ok((
+                        MailMessage {
+                            id: message_id,
+                            from: row.get(0)?,
+                            to: row.get(1)?,
+                            subject: row.get(2)?,
+                            body: row.get(3)?,
+                            created: row.get(4)?,
+                            is_recipient: false,
+                        },
+                        row.get::<_, i64>(5)?,
+                        row.get::<_, i64>(6)?,
+                        row.get::<_, bool>(7)?,
+                        row.get::<_, bool>(8)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((mut message, sender_id, recipient_id, sender_deleted, recipient_deleted)) = found
+        else {
+            return Ok(None);
+        };
+        let as_recipient = user_id == recipient_id && !recipient_deleted;
+        let as_sender = user_id == sender_id && !sender_deleted;
+        if !as_recipient && !as_sender {
+            return Ok(None);
+        }
+        message.is_recipient = as_recipient;
+        if as_recipient {
+            conn.execute(
+                "UPDATE messages SET read_at = unixepoch() WHERE id = ?1 AND read_at IS NULL",
+                params![message_id],
+            )?;
+        }
+        Ok(Some(message))
+    }
+
+    /// Deletes the user's own copy; the row goes away once both sides have.
+    pub fn delete_message(&self, user_id: i64, message_id: i64) -> Result<(), DbError> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        let row: Option<(i64, i64)> = tx
+            .query_row(
+                "SELECT sender_id, recipient_id FROM messages WHERE id = ?1",
+                params![message_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        let (sender_id, recipient_id) = row.ok_or(DbError::NotFound)?;
+        if user_id != sender_id && user_id != recipient_id {
+            return Err(DbError::NotFound);
+        }
+        if user_id == recipient_id {
+            tx.execute("UPDATE messages SET recipient_deleted = 1 WHERE id = ?1", params![message_id])?;
+        }
+        if user_id == sender_id {
+            tx.execute("UPDATE messages SET sender_deleted = 1 WHERE id = ?1", params![message_id])?;
+        }
+        tx.execute(
+            "DELETE FROM messages WHERE id = ?1 AND sender_deleted = 1 AND recipient_deleted = 1",
+            params![message_id],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn unread_mail_count(&self, user_id: i64) -> Result<i64, DbError> {
+        Ok(self.conn().query_row(
+            "SELECT COUNT(*) FROM messages
+             WHERE recipient_id = ?1 AND recipient_deleted = 0 AND read_at IS NULL",
+            params![user_id],
+            |r| r.get(0),
+        )?)
+    }
+
+    pub fn add_block(&self, user_id: i64, blocked_id: i64) -> Result<(), DbError> {
+        self.conn().execute(
+            "INSERT OR IGNORE INTO blocks (user_id, blocked_id) VALUES (?1, ?2)",
+            params![user_id, blocked_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn remove_block(&self, user_id: i64, blocked_id: i64) -> Result<(), DbError> {
+        self.conn().execute(
+            "DELETE FROM blocks WHERE user_id = ?1 AND blocked_id = ?2",
+            params![user_id, blocked_id],
+        )?;
+        Ok(())
+    }
+
+    /// Names of the users this user has blocked.
+    pub fn list_blocks(&self, user_id: i64) -> Result<Vec<String>, DbError> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT u.username FROM blocks b JOIN users u ON u.id = b.blocked_id
+             WHERE b.user_id = ?1 ORDER BY u.username",
+        )?;
+        let rows = stmt.query_map(params![user_id], |r| r.get(0))?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
 }
 
 #[cfg(test)]
@@ -989,6 +1271,114 @@ mod tests {
         db.delete_thread(t1).unwrap();
         db.delete_board(board, true).unwrap();
         assert_eq!(db.unread_thread_total(bob).unwrap(), 1);
+    }
+
+    #[test]
+    fn mail_delivery_reading_and_unread_count() {
+        let (db, alice, bob, _) = alice_bob();
+        let id = db.send_message(alice, bob, "Hello", "first line\nsecond").unwrap();
+        assert_eq!(db.unread_mail_count(bob).unwrap(), 1);
+        assert_eq!(db.unread_mail_count(alice).unwrap(), 0);
+
+        let inbox = db.list_folder(bob, Folder::Inbox).unwrap();
+        assert_eq!((inbox.len(), inbox[0].other.as_str(), inbox[0].unread), (1, "alice", true));
+        let sent = db.list_folder(alice, Folder::Sent).unwrap();
+        assert_eq!((sent.len(), sent[0].other.as_str(), sent[0].unread), (1, "bob", false));
+        assert!(db.list_folder(alice, Folder::Inbox).unwrap().is_empty());
+
+        // The sender reading her copy doesn't mark it read for Bob.
+        let m = db.read_message(alice, id).unwrap().unwrap();
+        assert!(!m.is_recipient);
+        assert_eq!(db.unread_mail_count(bob).unwrap(), 1);
+
+        let m = db.read_message(bob, id).unwrap().unwrap();
+        assert!(m.is_recipient);
+        assert_eq!((m.from.as_str(), m.to.as_str(), m.body.as_str()), ("alice", "bob", "first line\nsecond"));
+        assert_eq!(db.unread_mail_count(bob).unwrap(), 0);
+        assert!(!db.list_folder(bob, Folder::Inbox).unwrap()[0].unread);
+    }
+
+    #[test]
+    fn only_the_parties_can_read_or_delete() {
+        let (db, alice, bob, _) = alice_bob();
+        let carol = db.create_user("carol", "h").unwrap();
+        let id = db.send_message(alice, bob, "Secret", "x").unwrap();
+        assert!(db.read_message(carol, id).unwrap().is_none());
+        assert_eq!(db.delete_message(carol, id), Err(DbError::NotFound));
+        assert!(db.read_message(bob, id).unwrap().is_some(), "still there");
+    }
+
+    #[test]
+    fn each_side_deletes_its_own_copy_and_the_row_is_purged_at_the_end() {
+        let (db, alice, bob, _) = alice_bob();
+        let id = db.send_message(alice, bob, "Hi", "x").unwrap();
+
+        db.delete_message(bob, id).unwrap();
+        assert!(db.list_folder(bob, Folder::Inbox).unwrap().is_empty());
+        assert_eq!(db.unread_mail_count(bob).unwrap(), 0, "deleted mail isn't unread");
+        assert!(db.read_message(bob, id).unwrap().is_none());
+        assert_eq!(db.list_folder(alice, Folder::Sent).unwrap().len(), 1, "sender keeps hers");
+        assert!(db.read_message(alice, id).unwrap().is_some());
+
+        db.delete_message(alice, id).unwrap();
+        let rows: i64 = db.conn().query_row("SELECT COUNT(*) FROM messages", [], |r| r.get(0)).unwrap();
+        assert_eq!(rows, 0, "purged once both sides deleted");
+        assert_eq!(db.delete_message(alice, id), Err(DbError::NotFound));
+    }
+
+    #[test]
+    fn messages_to_yourself_can_be_deleted_in_one_go() {
+        let (db, alice, _, _) = alice_bob();
+        let id = db.send_message(alice, alice, "Note", "remember").unwrap();
+        assert_eq!(db.list_folder(alice, Folder::Inbox).unwrap().len(), 1);
+        db.delete_message(alice, id).unwrap();
+        assert!(db.list_folder(alice, Folder::Inbox).unwrap().is_empty());
+        assert!(db.list_folder(alice, Folder::Sent).unwrap().is_empty());
+    }
+
+    #[test]
+    fn blocked_senders_are_refused_until_unblocked() {
+        let (db, alice, bob, _) = alice_bob();
+        db.add_block(bob, alice).unwrap();
+        db.add_block(bob, alice).unwrap(); // harmless twice
+        assert_eq!(db.list_blocks(bob).unwrap(), ["alice"]);
+        assert_eq!(db.send_message(alice, bob, "Hi", "x"), Err(MailError::Blocked));
+        // Blocking is one-directional.
+        db.send_message(bob, alice, "Hi", "x").unwrap();
+        db.remove_block(bob, alice).unwrap();
+        assert!(db.list_blocks(bob).unwrap().is_empty());
+        db.send_message(alice, bob, "Hi", "x").unwrap();
+    }
+
+    #[test]
+    fn per_recipient_rate_and_mailbox_caps() {
+        let (db, alice, bob, _) = alice_bob();
+        for _ in 0..MAIL_PAIR_MAX {
+            db.send_message(alice, bob, "Hi", "x").unwrap();
+        }
+        assert_eq!(db.send_message(alice, bob, "Hi", "x"), Err(MailError::TooFast));
+        // Only that pair is throttled.
+        let carol = db.create_user("carol", "h").unwrap();
+        db.send_message(alice, carol, "Hi", "x").unwrap();
+
+        // Inbox cap: fill Dave's inbox with old messages from many senders.
+        let dave = db.create_user("dave", "h").unwrap();
+        let conn = db.conn();
+        for _ in 0..MAX_MAILBOX {
+            conn.execute(
+                "INSERT INTO messages (sender_id, recipient_id, subject, body) VALUES (?1, ?2, 's', 'b')",
+                params![carol, dave],
+            )
+            .unwrap();
+        }
+        drop(conn);
+        assert_eq!(db.send_message(alice, dave, "Hi", "x"), Err(MailError::RecipientFull));
+        // Carol's sent folder is now full too.
+        assert_eq!(db.send_message(carol, alice, "Hi", "x"), Err(MailError::SentFull));
+        // Deleting frees space.
+        let first = db.list_folder(dave, Folder::Inbox).unwrap()[0].id;
+        db.delete_message(dave, first).unwrap();
+        db.send_message(alice, dave, "Hi", "x").unwrap();
     }
 
     #[test]

@@ -200,6 +200,16 @@ impl TextInput {
         self.chars.is_empty()
     }
 
+    /// Replaces the contents (used to prefill fields, e.g. for a reply).
+    pub fn set(&mut self, text: &str) {
+        self.chars = text
+            .chars()
+            .filter(|c| !c.is_control())
+            .take(self.max_len)
+            .collect();
+        self.cursor = self.chars.len();
+    }
+
     pub fn clear(&mut self) {
         self.chars.clear();
         self.cursor = 0;

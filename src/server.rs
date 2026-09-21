@@ -19,7 +19,7 @@ use crate::state::{
 };
 use crate::terminal::TerminalHandle;
 use crate::ui::{Action, App, KeyInfo, OnlineInfo, Request, Response};
-use crate::{auth, boards, content};
+use crate::{auth, boards, content, mail};
 
 type SshTerminal = Terminal<CrosstermBackend<TerminalHandle>>;
 
@@ -147,30 +147,46 @@ impl BbsHandler {
         lock_ui(&self.ui).redraw();
     }
 
-    /// Starts the task that turns chat-room events into redraws. It runs for
-    /// the whole session; the screen ignores events unless chat is open.
-    fn spawn_chat_listener(&mut self) {
+    /// Starts the task that turns live events (chat-room activity, newly
+    /// delivered mail) into redraws. It runs for the whole session; the
+    /// screen ignores events that don't concern what it is showing.
+    fn spawn_listener(&mut self) {
         let ui = Arc::clone(&self.ui);
         let room = Arc::clone(&self.shared.chat);
         let mut events = room.subscribe();
+        let mut mail = self.shared.mail.subscribe();
         let task = tokio::spawn(async move {
             loop {
-                match events.recv().await {
-                    Ok(event) => {
-                        let mut ui = lock_ui(&ui);
-                        if ui.app.as_mut().is_some_and(|app| app.on_chat_event(event)) {
-                            ui.redraw();
+                tokio::select! {
+                    event = events.recv() => match event {
+                        Ok(event) => {
+                            let mut ui = lock_ui(&ui);
+                            if ui.app.as_mut().is_some_and(|app| app.on_chat_event(event)) {
+                                ui.redraw();
+                            }
                         }
-                    }
-                    // Fell too far behind: start over from a fresh snapshot.
-                    Err(RecvError::Lagged(_)) => {
-                        let snapshot = room.snapshot();
-                        let mut ui = lock_ui(&ui);
-                        if ui.app.as_mut().is_some_and(|app| app.on_chat_snapshot(snapshot)) {
-                            ui.redraw();
+                        // Fell too far behind: start over from a fresh snapshot.
+                        Err(RecvError::Lagged(_)) => {
+                            let snapshot = room.snapshot();
+                            let mut ui = lock_ui(&ui);
+                            if ui.app.as_mut().is_some_and(|app| app.on_chat_snapshot(snapshot)) {
+                                ui.redraw();
+                            }
                         }
-                    }
-                    Err(RecvError::Closed) => break,
+                        Err(RecvError::Closed) => break,
+                    },
+                    notice = mail.recv() => match notice {
+                        Ok(notice) => {
+                            let mut ui = lock_ui(&ui);
+                            if ui.app.as_mut().is_some_and(|app| app.on_mail_notice(notice)) {
+                                ui.redraw();
+                            }
+                        }
+                        // A missed notice only means the menu count is stale
+                        // until the mailbox is next opened.
+                        Err(RecvError::Lagged(_)) => {}
+                        Err(RecvError::Closed) => break,
+                    },
                 }
             }
         });
@@ -279,6 +295,48 @@ impl BbsHandler {
             Request::WhoIsOnline => self.who_is_online(),
             Request::ChangePassword { current, new } => {
                 Response::PasswordChanged(self.change_password(current, new).await)
+            }
+            Request::OpenMailbox { folder } => {
+                let Some(identity) = &self.identity else {
+                    return Response::Error(INTERNAL_ERROR.into());
+                };
+                mail::open_mailbox(&self.shared, identity, folder, None).await
+            }
+            Request::ReadMessage { id } => {
+                let Some(identity) = &self.identity else {
+                    return Response::Error(INTERNAL_ERROR.into());
+                };
+                mail::read_message(&self.shared, identity, id).await
+            }
+            Request::SendMail { to, subject, body } => {
+                let Some(identity) = &self.identity else {
+                    return Response::Error(INTERNAL_ERROR.into());
+                };
+                mail::send(&self.shared, identity, to, subject, body).await
+            }
+            Request::DeleteMessage { id, folder } => {
+                let Some(identity) = &self.identity else {
+                    return Response::Error(INTERNAL_ERROR.into());
+                };
+                mail::delete_message(&self.shared, identity, id, folder).await
+            }
+            Request::ListBlocks => {
+                let Some(identity) = &self.identity else {
+                    return Response::Error(INTERNAL_ERROR.into());
+                };
+                mail::list_blocks(&self.shared, identity, None).await
+            }
+            Request::BlockUser { name } => {
+                let Some(identity) = &self.identity else {
+                    return Response::Error(INTERNAL_ERROR.into());
+                };
+                mail::block(&self.shared, identity, name).await
+            }
+            Request::UnblockUser { name } => {
+                let Some(identity) = &self.identity else {
+                    return Response::Error(INTERNAL_ERROR.into());
+                };
+                mail::unblock(&self.shared, identity, name).await
             }
             Request::JoinChat => self.join_chat().await,
             Request::LeaveChat => {
@@ -701,11 +759,16 @@ impl Handler for BbsHandler {
             Some(id) => boards::unread_total(&self.shared, id).await,
             None => 0,
         };
+        let unread_mail = match identity.user_id() {
+            Some(id) => mail::unread_count(&self.shared, id).await,
+            None => 0,
+        };
         let mut app = App::new(identity);
         app.set_unread_threads(unread);
+        app.set_unread_mail(unread_mail);
         lock_ui(&self.ui).app = Some(app);
         self.join_online(session.handle());
-        self.spawn_chat_listener();
+        self.spawn_listener();
 
         reply.accept().await;
         Ok(())

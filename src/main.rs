@@ -49,6 +49,7 @@ async fn main() -> anyhow::Result<()> {
         limiter: Arc::new(Limiter::default()),
         online: Arc::new(Online::default()),
         chat: Arc::new(ChatRoom::new()),
+        mail: tokio::sync::broadcast::channel(64).0,
         dummy_hash,
     });
 

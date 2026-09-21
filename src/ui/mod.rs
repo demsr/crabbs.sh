@@ -3,6 +3,7 @@ mod chat;
 mod compose;
 mod input;
 mod keys;
+mod mail;
 mod online;
 mod password;
 mod register;
@@ -16,12 +17,18 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap};
 
 use crate::chat::{ChatEvent, ChatSnapshot};
+use crate::db::{Folder, MailItem, MailMessage};
+use crate::mail::MailNotice;
 use crate::state::Identity;
 use boards::{BoardList, BoardsEvent, ThreadEvent, ThreadList, ThreadView, ThreadsEvent};
 use chat::{ChatAction, ChatScreen};
 use compose::{Compose, ComposeEvent};
 use input::{Key, KeyParser};
 use keys::{KeysEvent, KeysScreen};
+use mail::{
+    BlocksEvent, BlocksScreen, MailCompose, MailComposeEvent, MailboxEvent, MailboxScreen,
+    MessageEvent, MessageScreen,
+};
 use online::{OnlineEvent, OnlineScreen};
 use password::{PasswordEvent, PasswordForm};
 use register::{FormEvent, RegisterForm};
@@ -77,6 +84,29 @@ pub enum Request {
         current: String,
         new: String,
     },
+    OpenMailbox {
+        folder: Folder,
+    },
+    ReadMessage {
+        id: i64,
+    },
+    SendMail {
+        to: String,
+        subject: String,
+        body: String,
+    },
+    DeleteMessage {
+        id: i64,
+        /// Folder to show afterwards.
+        folder: Folder,
+    },
+    ListBlocks,
+    BlockUser {
+        name: String,
+    },
+    UnblockUser {
+        name: String,
+    },
     /// Members only: enter the chat room. Answered with a snapshot.
     JoinChat,
     LeaveChat,
@@ -111,6 +141,23 @@ pub enum Response {
     Online {
         users: Vec<OnlineInfo>,
         guests: usize,
+    },
+    Mailbox {
+        folder: Folder,
+        items: Vec<MailItem>,
+        /// Unread messages in the inbox (whichever folder is shown).
+        unread: i64,
+        notice: Option<String>,
+    },
+    Message {
+        message: MailMessage,
+        unread: i64,
+    },
+    /// A message was refused; the compose screen stays open.
+    MailFailed(String),
+    Blocks {
+        names: Vec<String>,
+        notice: Option<String>,
     },
     /// Outcome of a password change: a confirmation, or why it was refused.
     PasswordChanged(Result<String, String>),
@@ -185,6 +232,7 @@ pub enum Action {
 enum MenuItem {
     Board,
     Chat,
+    Mail,
     Online,
     Register,
     Keys,
@@ -194,13 +242,17 @@ enum MenuItem {
 }
 
 impl MenuItem {
-    fn label(self, unread_threads: i64) -> String {
+    fn label(self, unread_threads: i64, unread_mail: i64) -> String {
         if self == MenuItem::Board && unread_threads > 0 {
             return format!("Message boards ({unread_threads} unread)");
+        }
+        if self == MenuItem::Mail && unread_mail > 0 {
+            return format!("Mail ({unread_mail} unread)");
         }
         match self {
             MenuItem::Board => "Message boards",
             MenuItem::Chat => "Chat",
+            MenuItem::Mail => "Mail",
             MenuItem::Online => "Who's online",
             MenuItem::Register => "Register an account",
             MenuItem::Keys => "SSH keys",
@@ -224,6 +276,16 @@ enum Screen {
     Online(OnlineScreen),
     Chat(ChatScreen),
     Password(PasswordForm),
+    Mailbox(MailboxScreen),
+    Message(MessageScreen),
+    MailCompose(Box<MailComposeScreen>),
+    Blocks(BlocksScreen),
+}
+
+/// Like `ComposeScreen`: remembers where to return if cancelled.
+struct MailComposeScreen {
+    form: MailCompose,
+    back: Screen,
 }
 
 /// The compose screen remembers what to return to if it's cancelled.
@@ -246,11 +308,33 @@ pub struct App {
     queue: VecDeque<Key>,
     /// Threads with unread posts, shown on the main menu.
     unread_threads: i64,
+    /// Unread messages in the inbox, shown on the main menu.
+    unread_mail: i64,
 }
 
 impl App {
     pub fn set_unread_threads(&mut self, count: i64) {
         self.unread_threads = count;
+    }
+
+    pub fn set_unread_mail(&mut self, count: i64) {
+        self.unread_mail = count;
+    }
+
+    /// Mail was delivered somewhere. If it's for this user, note it. Returns
+    /// whether the screen changed.
+    pub fn on_mail_notice(&mut self, notice: MailNotice) -> bool {
+        if self.identity.user_id() != Some(notice.to_user_id) {
+            return false;
+        }
+        self.unread_mail += 1;
+        let hint = if matches!(self.screen, Screen::Mailbox(_)) {
+            " Press r to refresh."
+        } else {
+            ""
+        };
+        self.set_status(format!("New mail from {}.{hint}", notice.from), false);
+        true
     }
 
     pub fn new(identity: Identity) -> Self {
@@ -265,6 +349,7 @@ impl App {
             parser: KeyParser::default(),
             queue: VecDeque::new(),
             unread_threads: 0,
+            unread_mail: 0,
         }
     }
 
@@ -281,6 +366,8 @@ impl App {
             Screen::Online(_) => "Checking who's online",
             Screen::Chat(_) => "Chatting",
             Screen::Password(_) => "Account settings",
+            Screen::Mailbox(_) | Screen::Message(_) | Screen::Blocks(_) => "Reading mail",
+            Screen::MailCompose(_) => "Writing mail",
         }
     }
 
@@ -305,10 +392,15 @@ impl App {
     }
 
     fn menu_items(&self) -> Vec<MenuItem> {
-        let mut items = vec![MenuItem::Board, MenuItem::Chat, MenuItem::Online];
+        let mut items = vec![MenuItem::Board, MenuItem::Chat];
         match self.identity {
-            Identity::Guest => items.push(MenuItem::Register),
-            Identity::User { .. } => items.extend([MenuItem::Keys, MenuItem::Password]),
+            Identity::Guest => items.extend([MenuItem::Online, MenuItem::Register]),
+            Identity::User { .. } => items.extend([
+                MenuItem::Mail,
+                MenuItem::Online,
+                MenuItem::Keys,
+                MenuItem::Password,
+            ]),
         }
         items.extend([MenuItem::About, MenuItem::LogOff]);
         items
@@ -400,6 +492,37 @@ impl App {
             Response::Online { users, guests } => {
                 if let Screen::Online(screen) = &mut self.screen {
                     screen.set(users, guests);
+                }
+            }
+            Response::Mailbox {
+                folder,
+                items,
+                unread,
+                notice,
+            } => {
+                self.unread_mail = unread;
+                let mut mailbox = MailboxScreen::new(folder);
+                mailbox.set(items, unread);
+                self.screen = Screen::Mailbox(mailbox);
+                if let Some(text) = notice {
+                    self.set_status(text, false);
+                }
+            }
+            Response::Message { message, unread } => {
+                self.unread_mail = unread;
+                self.screen = Screen::Message(MessageScreen::new(message));
+            }
+            Response::MailFailed(message) => {
+                if let Screen::MailCompose(screen) = &mut self.screen {
+                    screen.form.fail(message);
+                }
+            }
+            Response::Blocks { names, notice } => {
+                let mut blocks = BlocksScreen::new();
+                blocks.set(names);
+                self.screen = Screen::Blocks(blocks);
+                if let Some(text) = notice {
+                    self.set_status(text, false);
                 }
             }
             Response::PasswordChanged(Ok(notice)) => {
@@ -526,6 +649,70 @@ impl App {
                 }
                 ComposeEvent::Submit(request) => Some(Action::Request(request)),
             },
+            Screen::Mailbox(mailbox) => match mailbox.handle(key) {
+                MailboxEvent::None => None,
+                MailboxEvent::Back => {
+                    self.screen = Screen::Menu;
+                    None
+                }
+                // The mailbox stays up until the message arrives.
+                MailboxEvent::Open(id) => Some(Action::Request(Request::ReadMessage { id })),
+                MailboxEvent::Delete(id) => Some(Action::Request(Request::DeleteMessage {
+                    id,
+                    folder: mailbox.folder(),
+                })),
+                MailboxEvent::Refresh => Some(Action::Request(Request::OpenMailbox {
+                    folder: mailbox.folder(),
+                })),
+                MailboxEvent::Compose => self.start_mail_compose(MailCompose::new(None, None)),
+                MailboxEvent::Switch(folder) => {
+                    self.screen = Screen::Mailbox(MailboxScreen::new(folder));
+                    Some(Action::Request(Request::OpenMailbox { folder }))
+                }
+                MailboxEvent::Blocks => {
+                    self.screen = Screen::Blocks(BlocksScreen::new());
+                    Some(Action::Request(Request::ListBlocks))
+                }
+            },
+            Screen::Message(message) => match message.handle(key) {
+                MessageEvent::None => None,
+                MessageEvent::Back(folder) => {
+                    self.screen = Screen::Mailbox(MailboxScreen::new(folder));
+                    Some(Action::Request(Request::OpenMailbox { folder }))
+                }
+                MessageEvent::Reply { to, subject } => {
+                    self.start_mail_compose(MailCompose::new(Some(&to), Some(&subject)))
+                }
+                MessageEvent::Delete(id) => Some(Action::Request(Request::DeleteMessage {
+                    id,
+                    folder: message.folder(),
+                })),
+                MessageEvent::Block(name) => Some(Action::Request(Request::BlockUser { name })),
+            },
+            Screen::MailCompose(screen) => match screen.form.handle(key) {
+                MailComposeEvent::None => None,
+                MailComposeEvent::Cancel => {
+                    if let Screen::MailCompose(screen) =
+                        std::mem::replace(&mut self.screen, Screen::Menu)
+                    {
+                        self.screen = screen.back;
+                    }
+                    None
+                }
+                MailComposeEvent::Submit { to, subject, body } => {
+                    Some(Action::Request(Request::SendMail { to, subject, body }))
+                }
+            },
+            Screen::Blocks(blocks) => match blocks.handle(key) {
+                BlocksEvent::None => None,
+                BlocksEvent::Back => {
+                    self.screen = Screen::Mailbox(MailboxScreen::new(Folder::Inbox));
+                    Some(Action::Request(Request::OpenMailbox {
+                        folder: Folder::Inbox,
+                    }))
+                }
+                BlocksEvent::Unblock(name) => Some(Action::Request(Request::UnblockUser { name })),
+            },
             Screen::Password(form) => match form.handle(key) {
                 PasswordEvent::None => None,
                 PasswordEvent::Cancel => {
@@ -581,6 +768,12 @@ impl App {
         None
     }
 
+    fn start_mail_compose(&mut self, form: MailCompose) -> Option<Action> {
+        let back = std::mem::replace(&mut self.screen, Screen::Menu);
+        self.screen = Screen::MailCompose(Box::new(MailComposeScreen { form, back }));
+        None
+    }
+
     fn handle_menu_key(&mut self, key: Key) -> Option<Action> {
         let count = self.menu_items().len();
         match key {
@@ -622,6 +815,12 @@ impl App {
                 return Some(Action::Request(Request::WhoIsOnline));
             }
             MenuItem::Register => self.screen = Screen::Register(RegisterForm::new()),
+            MenuItem::Mail => {
+                self.screen = Screen::Mailbox(MailboxScreen::new(Folder::Inbox));
+                return Some(Action::Request(Request::OpenMailbox {
+                    folder: Folder::Inbox,
+                }));
+            }
             MenuItem::Password => {
                 self.screen = Screen::Password(PasswordForm::new(self.identity.display_name()));
             }
@@ -659,6 +858,10 @@ impl App {
             Screen::Online(screen) => screen.draw(frame, body),
             Screen::Chat(chat) => chat.draw(frame, body),
             Screen::Password(form) => form.draw(frame, body),
+            Screen::Mailbox(mailbox) => mailbox.draw(frame, body),
+            Screen::Message(message) => message.draw(frame, body),
+            Screen::MailCompose(screen) => screen.form.draw(frame, body),
+            Screen::Blocks(blocks) => blocks.draw(frame, body),
         }
         self.draw_status(frame, chunks[2]);
     }
@@ -680,7 +883,7 @@ impl App {
             .menu_items()
             .iter()
             .enumerate()
-            .map(|(i, item)| ListItem::new(format!("[{}] {}", i + 1, item.label(self.unread_threads))))
+            .map(|(i, item)| ListItem::new(format!("[{}] {}", i + 1, item.label(self.unread_threads, self.unread_mail))))
             .collect();
 
         let list = List::new(items)

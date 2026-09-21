@@ -126,10 +126,40 @@ arrives. A joining session gets a snapshot stamped with a sequence number and
 ignores older broadcast events, so nothing is shown twice or lost, and a
 listener that falls too far behind resynchronises from a fresh snapshot.
 
+## Mail
+
+Main menu → **Mail**: private messages between registered users, delivered
+even if the recipient is offline. The main menu shows `Mail (N unread)`, and
+a user who is connected is told immediately ("New mail from alice.") without
+pressing anything.
+
+- Inbox / Sent (Tab switches). Enter reads, `c` composes, `d` deletes, `r`
+  refreshes, `B` opens the list of blocked users.
+- Composing: To (a username, any capitalisation), Subject, Message. Ctrl-D
+  sends, Esc cancels, Tab moves between fields. The message follows the same
+  rules as posts (up to 2000 characters, spacing and indentation kept).
+- Reading a message marks it read. `r` replies (recipient and "Re:" subject
+  prefilled), `d` deletes, `b` blocks the sender.
+- Each side deletes only its own copy; a message disappears from the database
+  once both have deleted it.
+- **Blocking:** a blocked user's mail is refused ("You can't send messages to
+  that user"). Blocking is one-way and reversible from the blocked-users list.
+
+Limits, because open registration plus private messages invites abuse: at
+most 10 messages per 10 minutes per sender, 5 per 10 minutes to any one
+recipient, and 200 messages per folder (a full inbox refuses new mail, a full
+sent folder has to be cleaned up before sending more). Guests and suspended
+accounts can't use mail.
+
+**Privacy:** messages are stored unencrypted in `bbs.db`, so anyone with
+access to the database file can read them. The admin tool deliberately has no
+command to read mail, but it is not a security boundary against the person
+running the server.
+
 ## Who's online
 
 Main menu → **Who's online** lists the registered users currently connected,
-what each is doing (main menu, reading a thread, writing a post, chatting, ...) and
+what each is doing (main menu, reading a thread, writing a post, chatting, reading mail, ...) and
 for how long, with a `[sysop]` badge for sysops. Guests are only counted, not
 named. `r` refreshes the snapshot.
 
@@ -186,6 +216,8 @@ account from the database, so a demotion or ban takes effect at once.
   `src/state.rs` accordingly.
 - Chat is registered-users only, rate limited per user, sanitised on the
   server, and checks for suspension on every message.
+- Mail has per-sender and per-recipient rate limits, mailbox size caps and a
+  block list; every action re-checks the account in the database.
 - Only `password` and `publickey` authentication are offered. Exec,
   subsystem (sftp) and port-forwarding requests are refused.
 - Bans and roles are enforced from the database on every action, not from
@@ -214,11 +246,13 @@ account from the database, so a demotion or ban takes effect at once.
 - `src/state.rs` — state shared by all connections (DB, rate limiter,
   who's-online registry, session `Identity`)
 - `src/db.rs` — SQLite schema, migrations and queries (`users`, `ssh_keys`,
-  `boards`, `threads`, `posts`, `thread_reads`), including everything the
-  admin tool uses
+  `boards`, `threads`, `posts`, `thread_reads`, `messages`, `blocks`),
+  including everything the admin tool uses
 - `src/boards.rs` — board requests: permission checks, validation, rate
   limiting; calls into `db.rs`
 - `src/chat.rs` — the chat room: membership, history, sequenced broadcast
+- `src/mail.rs` — mail requests: permissions, validation, limits, delivery
+  notices
 - `src/content.rs` — sanitising and limits for titles, post bodies and chat
   lines
 - `src/auth.rs` — username/password validation, Argon2, public-key parsing
@@ -229,7 +263,8 @@ account from the database, so a demotion or ban takes effect at once.
   bytes into keys and has the text-field widget; `register.rs` and
   `keys.rs`, `boards.rs` (board list, thread list, thread view),
   `compose.rs` (multi-line editor and compose screen), `online.rs`,
-  `chat.rs` (the chat screen) and `password.rs` are screens.
+  `chat.rs` (the chat screen), `password.rs` and `mail.rs` (mailbox, message
+  view, compose, blocked list) are screens.
 
 ### Adding a screen
 
@@ -237,11 +272,12 @@ account from the database, so a demotion or ban takes effect at once.
 2. Give it `handle(Key) -> Event` and `draw(frame, area)` methods.
 3. If it needs the database, add a `Request`/`Response` pair and handle the
    request in `BbsHandler::serve`.
-4. If it needs to update while the user is idle (like chat), the session's
-   screen state is shared with a background task through a mutex in
-   `server.rs`; never hold that lock across an `.await`.
+4. If it needs to update while the user is idle (like chat or new-mail
+   notices), the session's screen state is shared with a background listener
+   through a mutex in `server.rs`; never hold that lock across an `.await`.
+   Add a broadcast channel to `Shared` and a branch in `spawn_listener`.
 
 ## Next steps
 
 - Thread/post pagination beyond the current caps
-- Chat rooms/channels, private messages between users
+- Chat rooms/channels

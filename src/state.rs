@@ -53,6 +53,8 @@ pub struct Shared {
     pub limiter: Arc<Limiter>,
     pub online: Arc<Online>,
     pub chat: Arc<ChatRoom>,
+    /// Announces delivered mail to the recipient's live sessions.
+    pub mail: tokio::sync::broadcast::Sender<crate::mail::MailNotice>,
     /// Verified against when a username doesn't exist, so unknown and known
     /// users take equally long to reject.
     pub dummy_hash: String,
@@ -82,6 +84,7 @@ pub enum Event {
     ChatMessage,
     /// A wrong "current password" while changing the password.
     PasswordAttempt,
+    MailSend,
 }
 
 impl Event {
@@ -93,6 +96,7 @@ impl Event {
             Event::NewThread => (3, Duration::from_secs(60 * 60)),
             Event::ChatMessage => (8, Duration::from_secs(10)),
             Event::PasswordAttempt => (5, Duration::from_secs(10 * 60)),
+            Event::MailSend => (10, Duration::from_secs(10 * 60)),
         }
     }
 }

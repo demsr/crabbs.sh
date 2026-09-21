@@ -8,6 +8,7 @@ pub mod boards;
 pub mod chat;
 pub mod content;
 pub mod db;
+pub mod mail;
 pub mod server;
 pub mod state;
 pub mod terminal;
