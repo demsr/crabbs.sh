@@ -1,0 +1,18 @@
+{
+  "name": "dev-rust-bbs",
+  "dockerComposeFile": "docker-compose.yml",
+  "service": "bbs",
+  "features": {
+    "ghcr.io/anthropics/devcontainer-features/claude-code:1.0": {}
+  },
+  "workspaceFolder": "/workspace",
+  "customizations": {
+    "vscode": {
+      "extensions": ["1yib.rust-bundle"]
+    }
+  },
+  "containerEnv": {
+    "CLAUDE_CONFIG_DIR": "/home/node/.claude"
+  },
+  "remoteUser": "node"
+}

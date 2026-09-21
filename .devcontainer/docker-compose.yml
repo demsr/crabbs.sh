@@ -1,0 +1,13 @@
+services:
+  bbs:
+    build: .
+    ports:
+      - 2222:2222
+    volumes:
+      - ..:/workspace:cached
+      - claude-code-config:/home/node/.claude
+    command: sleep infinity
+    environment:
+      - TZ=Europe/Berlin
+volumes:
+  claude-code-config:
