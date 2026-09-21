@@ -55,14 +55,19 @@ boards can be added by inserting into the `boards` table for now.
 - Board list / thread list: ↑/↓, Enter to open, Esc to go back
 - Thread list: `n` starts a new thread
 - Thread view: ↑/↓, PgUp/PgDn or Space to scroll, `r` to reply, Esc back
-- Editor: type normally (lines word-wrap at 76 columns), **Ctrl-D** posts,
-  Esc cancels, Tab switches between title and message
+- Editor: type normally (lines word-wrap at 78 columns), **Ctrl-D** posts,
+  Esc cancels, Tab indents (4 spaces), Shift-Tab jumps back to the title,
+  and Enter in the title moves to the message. Spacing and indentation are
+  preserved, so ASCII art and code blocks work (lines up to 78 columns fit
+  an 80-column terminal)
 
 Limits: titles 3-80 characters, messages up to 2000 characters, 200 posts per
 thread, 100 threads listed per board (most recently active first). Posting is
 limited to 10 posts per 10 minutes and 3 new threads per hour per user.
 All text is sanitised on the server (control characters and bidi/zero-width
-characters removed) regardless of what the client sent.
+characters removed) regardless of what the client sent. Whitespace is kept
+as typed, apart from trailing spaces, tabs (expanded to 4 spaces), runs of
+more than 3 blank lines and blank lines at the start or end of a post.
 
 ## Security notes
 

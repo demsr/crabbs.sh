@@ -6,9 +6,13 @@
 pub const TITLE_MIN: usize = 3;
 pub const TITLE_MAX: usize = 80;
 pub const BODY_MAX: usize = 2000;
-/// Column at which the post editor word-wraps, so posts read well on an
-/// 80-column terminal.
-pub const WRAP_COLS: usize = 76;
+/// Column at which the post editor word-wraps: the widest a line can be and
+/// still fit inside the borders of an 80-column terminal, so full-width
+/// ASCII art survives intact.
+pub const WRAP_COLS: usize = 78;
+/// Longest run of blank lines kept in a post.
+const MAX_BLANK_LINES: usize = 3;
+const TAB_WIDTH: usize = 4;
 
 /// Characters that can reorder or hide text and be used to spoof other
 /// users' content.
@@ -41,24 +45,27 @@ pub fn clean_title(raw: &str) -> Result<String, String> {
     Ok(title)
 }
 
-/// Multi-line text: newlines kept, tabs become spaces, other control
-/// characters dropped, trailing whitespace trimmed and runs of blank lines
-/// limited to one.
+/// Multi-line text. Indentation and inner spacing are kept exactly (people
+/// post ASCII art and code); what changes is: tabs become spaces, control
+/// characters are dropped, trailing whitespace is trimmed, runs of blank
+/// lines are limited, and blank lines at the very start and end are removed.
 pub fn clean_body(raw: &str) -> Result<String, String> {
     let normalized = raw.replace("\r\n", "\n").replace('\r', "\n");
     let mut lines: Vec<String> = Vec::new();
     let mut blank_run = 0;
     for line in normalized.split('\n') {
-        let cleaned: String = line
-            .chars()
-            .filter(|&c| !is_deceptive(c))
-            .map(|c| if c == '\t' { ' ' } else { c })
-            .filter(|c| !c.is_control())
-            .collect();
-        let cleaned = cleaned.trim_end().to_string();
+        let mut cleaned = String::new();
+        for c in line.chars().filter(|&c| !is_deceptive(c)) {
+            if c == '\t' {
+                cleaned.extend(std::iter::repeat_n(' ', TAB_WIDTH));
+            } else if !c.is_control() {
+                cleaned.push(c);
+            }
+        }
+        cleaned.truncate(cleaned.trim_end().len());
         if cleaned.is_empty() {
             blank_run += 1;
-            if blank_run > 1 {
+            if blank_run > MAX_BLANK_LINES {
                 continue;
             }
         } else {
@@ -66,10 +73,16 @@ pub fn clean_body(raw: &str) -> Result<String, String> {
         }
         lines.push(cleaned);
     }
-    let body = lines.join("\n").trim().to_string();
-    if body.is_empty() {
+    while lines.first().is_some_and(|l| l.is_empty()) {
+        lines.remove(0);
+    }
+    while lines.last().is_some_and(|l| l.is_empty()) {
+        lines.pop();
+    }
+    if lines.is_empty() {
         return Err("The message is empty.".into());
     }
+    let body = lines.join("\n");
     if body.chars().count() > BODY_MAX {
         return Err(format!("Messages can be at most {BODY_MAX} characters."));
     }
@@ -93,11 +106,23 @@ mod tests {
 
     #[test]
     fn body_is_sanitised() {
+        // more than MAX_BLANK_LINES blank lines are cut down
+        assert_eq!(clean_body("a\n\n\n\n\n\nb").unwrap(), "a\n\n\n\nb");
         assert_eq!(
             clean_body("hi\x1b[2J\r\n\r\n\r\n\r\nthere  \n").unwrap(),
-            "hi[2J\n\nthere"
+            "hi[2J\n\n\n\nthere"
         );
         assert!(clean_body(" \n\t\n").is_err());
         assert!(clean_body(&"x".repeat(BODY_MAX + 1)).is_err());
+    }
+
+    #[test]
+    fn body_keeps_indentation_and_spacing() {
+        let art = "   /\\_/\\\n  ( o.o )\n   > ^ <\n\n\nend   here";
+        assert_eq!(clean_body(art).unwrap(), art);
+        // leading blank lines go, but the first real line keeps its indent
+        assert_eq!(clean_body("\n\n    x\n").unwrap(), "    x");
+        // tabs are expanded, not collapsed to one space
+        assert_eq!(clean_body("\tx").unwrap(), "    x");
     }
 }

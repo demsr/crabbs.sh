@@ -85,6 +85,13 @@ impl TextArea {
                     self.insert_newline();
                 }
             }
+            Key::Tab => {
+                for _ in 0..4 {
+                    if self.len() < self.max_chars {
+                        self.insert_char(' ');
+                    }
+                }
+            }
             Key::Backspace => {
                 if self.col > 0 {
                     self.col -= 1;
@@ -240,12 +247,10 @@ impl Compose {
         match (key, self.focus) {
             (Key::Esc, _) => return ComposeEvent::Cancel,
             (Key::Ctrl('d'), _) => return self.submit(),
-            (Key::Tab | Key::BackTab, _) if matches!(self.kind, Kind::NewThread { .. }) => {
-                self.focus = match self.focus {
-                    Focus::Title => Focus::Body,
-                    Focus::Body => Focus::Title,
-                };
+            (Key::BackTab, Focus::Body) if matches!(self.kind, Kind::NewThread { .. }) => {
+                self.focus = Focus::Title;
             }
+            (Key::Tab, Focus::Title) => self.focus = Focus::Body,
             (Key::Enter | Key::Down, Focus::Title) => self.focus = Focus::Body,
             (other, Focus::Title) => {
                 self.title.handle(other);
@@ -315,7 +320,7 @@ impl Compose {
             (err.clone(), Color::Red)
         } else {
             (
-                "Ctrl-D: post · Esc: cancel · Tab: switch title/message".to_string(),
+                "Ctrl-D: post · Esc: cancel · Tab: indent · Shift-Tab: back to title".to_string(),
                 Color::Gray,
             )
         };
