@@ -114,7 +114,10 @@ impl Limiter {
         let now = Instant::now();
         let events = self.events.lock().unwrap_or_else(|e| e.into_inner());
         events.get(&(subject, event)).map_or(true, |hits| {
-            hits.iter().filter(|t| now.duration_since(**t) < window).count() < max
+            hits.iter()
+                .filter(|t| now.duration_since(**t) < window)
+                .count()
+                < max
         })
     }
 

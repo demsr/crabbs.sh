@@ -272,9 +272,11 @@ impl Db {
     pub fn board_name(&self, board_id: i64) -> Result<Option<String>, DbError> {
         Ok(self
             .conn()
-            .query_row("SELECT name FROM boards WHERE id = ?1", params![board_id], |r| {
-                r.get(0)
-            })
+            .query_row(
+                "SELECT name FROM boards WHERE id = ?1",
+                params![board_id],
+                |r| r.get(0),
+            )
             .optional()?)
     }
 

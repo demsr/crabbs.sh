@@ -13,9 +13,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap};
 
 use crate::state::Identity;
-use boards::{
-    BoardList, BoardsEvent, ThreadEvent, ThreadList, ThreadView, ThreadsEvent,
-};
+use boards::{BoardList, BoardsEvent, ThreadEvent, ThreadList, ThreadView, ThreadsEvent};
 use compose::{Compose, ComposeEvent};
 use input::{Key, KeyParser};
 use keys::{KeysEvent, KeysScreen};
@@ -28,17 +26,31 @@ const MAX_QUEUED_KEYS: usize = 4096;
 /// is synchronous; the SSH handler runs the request and feeds the answer back
 /// through `App::on_response`.
 pub enum Request {
-    Register { username: String, password: String },
+    Register {
+        username: String,
+        password: String,
+    },
     ListKeys,
     AddKey(String),
     DeleteKey(i64),
     ListBoards,
-    ListThreads { board_id: i64 },
-    OpenThread { thread_id: i64 },
+    ListThreads {
+        board_id: i64,
+    },
+    OpenThread {
+        thread_id: i64,
+    },
     /// `title` and `body` are already sanitised by the UI, and are
     /// sanitised again by the server.
-    CreateThread { board_id: i64, title: String, body: String },
-    Reply { thread_id: i64, body: String },
+    CreateThread {
+        board_id: i64,
+        title: String,
+        body: String,
+    },
+    Reply {
+        thread_id: i64,
+        body: String,
+    },
 }
 
 pub enum Response {
@@ -54,7 +66,10 @@ pub enum Response {
         threads: Vec<ThreadInfo>,
     },
     /// `to_end` scrolls to the newest post (used after posting).
-    Thread { detail: ThreadDetail, to_end: bool },
+    Thread {
+        detail: ThreadDetail,
+        to_end: bool,
+    },
     /// A post was rejected; the compose screen stays open.
     PostFailed(String),
     /// Something couldn't be loaded.
@@ -474,7 +489,10 @@ impl App {
 
     fn draw_status(&self, frame: &mut Frame, area: Rect) {
         let (text, color) = match &self.status {
-            Some(Status { text, is_error: true }) => (text.as_str(), Color::Red),
+            Some(Status {
+                text,
+                is_error: true,
+            }) => (text.as_str(), Color::Red),
             Some(Status { text, .. }) => (text.as_str(), Color::Yellow),
             None => ("", Color::Yellow),
         };

@@ -95,7 +95,11 @@ impl KeysScreen {
             self.keys
                 .iter()
                 .map(|k| {
-                    let comment = if k.comment.is_empty() { "-" } else { &k.comment };
+                    let comment = if k.comment.is_empty() {
+                        "-"
+                    } else {
+                        &k.comment
+                    };
                     ListItem::new(format!("{}  {}", k.fingerprint, comment))
                 })
                 .collect()
@@ -143,8 +147,10 @@ impl KeysScreen {
             }
             Mode::ConfirmDelete => {
                 frame.render_widget(
-                    Paragraph::new("Delete the selected key? Press 'y' to confirm, any other key to cancel.")
-                        .style(Style::default().fg(Color::Yellow)),
+                    Paragraph::new(
+                        "Delete the selected key? Press 'y' to confirm, any other key to cancel.",
+                    )
+                    .style(Style::default().fg(Color::Yellow)),
                     rows[1],
                 );
             }

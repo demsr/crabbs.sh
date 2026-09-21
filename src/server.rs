@@ -9,11 +9,11 @@ use russh::keys::PublicKey;
 use russh::server::{Auth, ChannelOpenHandle, Handler, Msg, Server as ServerTrait, Session};
 use russh::{Channel, ChannelId, Pty};
 
-use crate::{auth, boards};
 use crate::db::{DbError, MAX_KEYS_PER_USER};
 use crate::state::{ConnectionGuard, Event, Identity, Shared, Subject};
 use crate::terminal::TerminalHandle;
 use crate::ui::{Action, App, KeyInfo, Request, Response};
+use crate::{auth, boards};
 
 type SshTerminal = Terminal<CrosstermBackend<TerminalHandle>>;
 
@@ -83,13 +83,19 @@ impl BbsHandler {
     }
 
     fn auth_throttled(&self) -> bool {
-        self.peer_ip
-            .is_some_and(|ip| !self.shared.limiter.allowed(Subject::ip(ip), Event::AuthFailure))
+        self.peer_ip.is_some_and(|ip| {
+            !self
+                .shared
+                .limiter
+                .allowed(Subject::ip(ip), Event::AuthFailure)
+        })
     }
 
     fn note_auth_failure(&self) {
         if let Some(ip) = self.peer_ip {
-            self.shared.limiter.record(Subject::ip(ip), Event::AuthFailure);
+            self.shared
+                .limiter
+                .record(Subject::ip(ip), Event::AuthFailure);
         }
     }
 
@@ -214,10 +220,16 @@ impl BbsHandler {
         auth::validate_password(&username, &password)?;
 
         if let Some(ip) = self.peer_ip {
-            if !self.shared.limiter.allowed(Subject::ip(ip), Event::Registration) {
+            if !self
+                .shared
+                .limiter
+                .allowed(Subject::ip(ip), Event::Registration)
+            {
                 return Err("Too many registrations from your address. Try again later.".into());
             }
-            self.shared.limiter.record(Subject::ip(ip), Event::Registration);
+            self.shared
+                .limiter
+                .record(Subject::ip(ip), Event::Registration);
         }
 
         let _permit = self

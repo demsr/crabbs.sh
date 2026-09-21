@@ -111,13 +111,20 @@ impl BoardList {
                 .map(|b| {
                     ListItem::new(Line::from(vec![
                         Span::raw(format!("{:<14}", b.name)),
-                        Span::styled(format!("{}  ({} threads)", b.description, b.thread_count), DIM),
+                        Span::styled(
+                            format!("{}  ({} threads)", b.description, b.thread_count),
+                            DIM,
+                        ),
                     ]))
                 })
                 .collect()
         };
         let list = List::new(items)
-            .block(Block::default().title("Message boards").borders(Borders::ALL))
+            .block(
+                Block::default()
+                    .title("Message boards")
+                    .borders(Borders::ALL),
+            )
             .highlight_style(HIGHLIGHT)
             .highlight_symbol("> ");
         let mut state = ListState::default();
@@ -219,7 +226,11 @@ impl ThreadList {
             state.select(Some(self.selected));
         }
         frame.render_stateful_widget(list, body, &mut state);
-        draw_help(frame, help, "Enter: read · n: new thread · ↑/↓: move · Esc: back");
+        draw_help(
+            frame,
+            help,
+            "Enter: read · n: new thread · ↑/↓: move · Esc: back",
+        );
     }
 }
 
@@ -274,7 +285,10 @@ impl ThreadView {
     }
 
     fn scroll_by(&self, delta: isize) {
-        let max = self.total_lines.get().saturating_sub(self.page_height.get());
+        let max = self
+            .total_lines
+            .get()
+            .saturating_sub(self.page_height.get());
         let now = self.scroll.get().min(max);
         self.scroll.set(now.saturating_add_signed(delta).min(max));
     }
@@ -319,11 +333,17 @@ impl ThreadView {
             lines.push(Line::from(vec![
                 Span::styled(
                     format!("#{} {}", i + 1, post.author),
-                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(format!("  {}", post.created), DIM),
             ]));
-            lines.extend(wrap(&post.body, inner.width as usize).into_iter().map(Line::from));
+            lines.extend(
+                wrap(&post.body, inner.width as usize)
+                    .into_iter()
+                    .map(Line::from),
+            );
             lines.push(Line::default());
         }
 
@@ -334,9 +354,15 @@ impl ThreadView {
         self.scroll.set(scroll);
 
         frame.render_widget(
-            Paragraph::new(lines).block(block).scroll((scroll.min(u16::MAX as usize) as u16, 0)),
+            Paragraph::new(lines)
+                .block(block)
+                .scroll((scroll.min(u16::MAX as usize) as u16, 0)),
             body,
         );
-        draw_help(frame, help, "↑/↓/PgUp/PgDn: scroll · r: reply · Esc: back to threads");
+        draw_help(
+            frame,
+            help,
+            "↑/↓/PgUp/PgDn: scroll · r: reply · Esc: back to threads",
+        );
     }
 }

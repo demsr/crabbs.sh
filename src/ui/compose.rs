@@ -299,20 +299,15 @@ impl Compose {
             .split(area);
 
         frame.render_widget(
-            Paragraph::new(self.heading.clone())
-                .style(Style::default().fg(Color::Cyan)),
+            Paragraph::new(self.heading.clone()).style(Style::default().fg(Color::Cyan)),
             rows[0],
         );
         if is_new {
             self.title
                 .render(frame, rows[1], "Title", self.focus == Focus::Title);
         }
-        self.body.render(
-            frame,
-            rows[2],
-            "Message",
-            self.focus == Focus::Body,
-        );
+        self.body
+            .render(frame, rows[2], "Message", self.focus == Focus::Body);
 
         let (text, color) = if self.busy {
             ("Posting…".to_string(), Color::Yellow)
@@ -349,7 +344,11 @@ mod tests {
         let word = "word ";
         type_str(&mut area, &word.repeat(30));
         let value = area.value();
-        assert!(value.lines().all(|l| l.chars().count() <= content::WRAP_COLS));
+        assert!(
+            value
+                .lines()
+                .all(|l| l.chars().count() <= content::WRAP_COLS)
+        );
         assert!(value.lines().count() >= 2);
         assert_eq!(value.split_whitespace().count(), 30);
     }
@@ -358,8 +357,15 @@ mod tests {
     fn long_word_is_split() {
         let mut area = TextArea::new(1000);
         type_str(&mut area, &"x".repeat(content::WRAP_COLS + 10));
-        assert!(area.value().lines().all(|l| l.chars().count() <= content::WRAP_COLS));
-        assert_eq!(area.value().replace('\n', "").len(), content::WRAP_COLS + 10);
+        assert!(
+            area.value()
+                .lines()
+                .all(|l| l.chars().count() <= content::WRAP_COLS)
+        );
+        assert_eq!(
+            area.value().replace('\n', "").len(),
+            content::WRAP_COLS + 10
+        );
     }
 
     #[test]

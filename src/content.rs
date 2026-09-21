@@ -82,7 +82,10 @@ mod tests {
 
     #[test]
     fn title_is_collapsed_and_bounded() {
-        assert_eq!(clean_title("  hello \t  world\x1b[31m ").unwrap(), "hello world [31m");
+        assert_eq!(
+            clean_title("  hello \t  world\x1b[31m ").unwrap(),
+            "hello world [31m"
+        );
         assert!(clean_title("ab").is_err());
         assert!(clean_title(&"x".repeat(TITLE_MAX + 1)).is_err());
         assert_eq!(clean_title("a\u{202E}bc").unwrap(), "abc");
@@ -90,7 +93,10 @@ mod tests {
 
     #[test]
     fn body_is_sanitised() {
-        assert_eq!(clean_body("hi\x1b[2J\r\n\r\n\r\n\r\nthere  \n").unwrap(), "hi[2J\n\nthere");
+        assert_eq!(
+            clean_body("hi\x1b[2J\r\n\r\n\r\n\r\nthere  \n").unwrap(),
+            "hi[2J\n\nthere"
+        );
         assert!(clean_body(" \n\t\n").is_err());
         assert!(clean_body(&"x".repeat(BODY_MAX + 1)).is_err());
     }

@@ -10,8 +10,22 @@ pub const PASSWORD_MIN: usize = 8;
 pub const PASSWORD_MAX: usize = 128;
 
 const RESERVED_NAMES: &[&str] = &[
-    "guest", "admin", "administrator", "root", "sysop", "system", "bbs", "anonymous", "anon",
-    "null", "nobody", "everyone", "moderator", "mod", "support", "staff",
+    "guest",
+    "admin",
+    "administrator",
+    "root",
+    "sysop",
+    "system",
+    "bbs",
+    "anonymous",
+    "anon",
+    "null",
+    "nobody",
+    "everyone",
+    "moderator",
+    "mod",
+    "support",
+    "staff",
 ];
 
 pub fn validate_username(name: &str) -> Result<(), String> {
@@ -39,10 +53,14 @@ pub fn validate_username(name: &str) -> Result<(), String> {
 pub fn validate_password(username: &str, password: &str) -> Result<(), String> {
     let len = password.chars().count();
     if len < PASSWORD_MIN {
-        return Err(format!("Password must be at least {PASSWORD_MIN} characters."));
+        return Err(format!(
+            "Password must be at least {PASSWORD_MIN} characters."
+        ));
     }
     if len > PASSWORD_MAX {
-        return Err(format!("Password must be at most {PASSWORD_MAX} characters."));
+        return Err(format!(
+            "Password must be at most {PASSWORD_MAX} characters."
+        ));
     }
     if password.chars().any(char::is_control) {
         return Err("Password must not contain control characters.".into());
@@ -79,8 +97,10 @@ pub fn fingerprint(key: &PublicKey) -> String {
 /// Parses a pasted `authorized_keys`-style line. Returns the key and a
 /// display-safe comment.
 pub fn parse_public_key(line: &str) -> Result<(PublicKey, String), String> {
-    let key = PublicKey::from_openssh(line.trim())
-        .map_err(|_| "That doesn't look like an OpenSSH public key (e.g. 'ssh-ed25519 AAAA… comment').".to_string())?;
+    let key = PublicKey::from_openssh(line.trim()).map_err(|_| {
+        "That doesn't look like an OpenSSH public key (e.g. 'ssh-ed25519 AAAA… comment')."
+            .to_string()
+    })?;
     if matches!(key.algorithm(), russh::keys::Algorithm::Dsa) {
         return Err("DSA keys are not supported.".into());
     }
