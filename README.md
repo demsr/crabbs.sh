@@ -45,6 +45,25 @@ Back it up along with `data/bbs.db`.
 Usernames: 3-16 characters, letters/digits/`_`/`-`, starting with a letter,
 case-insensitive. Passwords: 8-128 characters.
 
+## Message boards
+
+Main menu → **Message boards**. Boards contain threads, threads contain posts.
+Everyone (including guests) can read; only registered users can post.
+Three boards (General, Tech, Off-Topic) are created on first start; further
+boards can be added by inserting into the `boards` table for now.
+
+- Board list / thread list: ↑/↓, Enter to open, Esc to go back
+- Thread list: `n` starts a new thread
+- Thread view: ↑/↓, PgUp/PgDn or Space to scroll, `r` to reply, Esc back
+- Editor: type normally (lines word-wrap at 76 columns), **Ctrl-D** posts,
+  Esc cancels, Tab switches between title and message
+
+Limits: titles 3-80 characters, messages up to 2000 characters, 200 posts per
+thread, 100 threads listed per board (most recently active first). Posting is
+limited to 10 posts per 10 minutes and 3 new threads per hour per user.
+All text is sanitised on the server (control characters and bidi/zero-width
+characters removed) regardless of what the client sent.
+
 ## Security notes
 
 - Passwords are hashed with Argon2id (random salt); nothing is stored in
@@ -73,14 +92,19 @@ case-insensitive. Passwords: 8-128 characters.
   key), session/PTY setup, and executing the UI's `Request`s
 - `src/state.rs` — state shared by all connections (DB, rate limiter,
   session `Identity`)
-- `src/db.rs` — SQLite schema and queries (`users`, `ssh_keys`)
+- `src/db.rs` — SQLite schema and queries (`users`, `ssh_keys`, `boards`,
+  `threads`, `posts`)
+- `src/boards.rs` — board requests: permission checks, validation, rate
+  limiting; calls into `db.rs`
+- `src/content.rs` — sanitising and limits for titles and post bodies
 - `src/auth.rs` — username/password validation, Argon2, public-key parsing
 - `src/terminal.rs` — adapts an SSH channel into an `io::Write` sink
 - `src/ui/` — the terminal UI. `App` in `mod.rs` is a small screen state
   machine; it is synchronous and asks the server to do async work by
   returning a `Request`, then receives a `Response`. `input.rs` parses raw
   bytes into keys and has the text-field widget; `register.rs` and
-  `keys.rs` are screens.
+  `keys.rs`, `boards.rs` (board list, thread list, thread view) and
+  `compose.rs` (multi-line editor and compose screen) are screens.
 
 ### Adding a screen
 
@@ -91,6 +115,8 @@ case-insensitive. Passwords: 8-128 characters.
 
 ## Next steps
 
-- Message boards (SQLite tables, board/thread/post screens)
+- Sysop role: create/delete boards, delete posts, ban users
+- Unread tracking and new-post indicators
+- Thread/post pagination beyond the current caps
 - Shared online-users registry for "Who's online" (and later live chat)
 - Password change, sysop/moderation tools

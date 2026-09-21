@@ -9,9 +9,9 @@ use russh::keys::PublicKey;
 use russh::server::{Auth, ChannelOpenHandle, Handler, Msg, Server as ServerTrait, Session};
 use russh::{Channel, ChannelId, Pty};
 
-use crate::auth;
+use crate::{auth, boards};
 use crate::db::{DbError, MAX_KEYS_PER_USER};
-use crate::state::{ConnectionGuard, Event, Identity, Shared};
+use crate::state::{ConnectionGuard, Event, Identity, Shared, Subject};
 use crate::terminal::TerminalHandle;
 use crate::ui::{Action, App, KeyInfo, Request, Response};
 
@@ -84,12 +84,12 @@ impl BbsHandler {
 
     fn auth_throttled(&self) -> bool {
         self.peer_ip
-            .is_some_and(|ip| !self.shared.limiter.allowed(ip, Event::AuthFailure))
+            .is_some_and(|ip| !self.shared.limiter.allowed(Subject::ip(ip), Event::AuthFailure))
     }
 
     fn note_auth_failure(&self) {
         if let Some(ip) = self.peer_ip {
-            self.shared.limiter.record(ip, Event::AuthFailure);
+            self.shared.limiter.record(Subject::ip(ip), Event::AuthFailure);
         }
     }
 
@@ -159,6 +159,25 @@ impl BbsHandler {
             Request::Register { username, password } => {
                 Response::Registered(self.register(username, password).await)
             }
+            Request::ListBoards => boards::list_boards(&self.shared).await,
+            Request::ListThreads { board_id } => boards::list_threads(&self.shared, board_id).await,
+            Request::OpenThread { thread_id } => {
+                boards::open_thread(&self.shared, thread_id, false).await
+            }
+            Request::CreateThread {
+                board_id,
+                title,
+                body,
+            } => match &self.identity {
+                Some(identity) => {
+                    boards::create_thread(&self.shared, identity, board_id, title, body).await
+                }
+                None => Response::Error(INTERNAL_ERROR.into()),
+            },
+            Request::Reply { thread_id, body } => match &self.identity {
+                Some(identity) => boards::reply(&self.shared, identity, thread_id, body).await,
+                None => Response::Error(INTERNAL_ERROR.into()),
+            },
             Request::ListKeys => self.keys_response(None).await,
             Request::AddKey(line) => {
                 let notice = self.add_key(line).await;
@@ -195,10 +214,10 @@ impl BbsHandler {
         auth::validate_password(&username, &password)?;
 
         if let Some(ip) = self.peer_ip {
-            if !self.shared.limiter.allowed(ip, Event::Registration) {
+            if !self.shared.limiter.allowed(Subject::ip(ip), Event::Registration) {
                 return Err("Too many registrations from your address. Try again later.".into());
             }
-            self.shared.limiter.record(ip, Event::Registration);
+            self.shared.limiter.record(Subject::ip(ip), Event::Registration);
         }
 
         let _permit = self
@@ -247,7 +266,7 @@ impl BbsHandler {
             Err(DbError::LimitReached) => {
                 Err(format!("You can store at most {MAX_KEYS_PER_USER} keys."))
             }
-            Err(DbError::Other) => Err(INTERNAL_ERROR.into()),
+            Err(DbError::Other | DbError::NotFound) => Err(INTERNAL_ERROR.into()),
         }
     }
 

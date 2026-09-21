@@ -56,6 +56,9 @@ impl Shared {
 pub enum Event {
     AuthFailure,
     Registration,
+    /// Any new post, including the first post of a new thread.
+    Post,
+    NewThread,
 }
 
 impl Event {
@@ -63,6 +66,8 @@ impl Event {
         match self {
             Event::AuthFailure => (10, Duration::from_secs(10 * 60)),
             Event::Registration => (3, Duration::from_secs(60 * 60)),
+            Event::Post => (10, Duration::from_secs(10 * 60)),
+            Event::NewThread => (3, Duration::from_secs(60 * 60)),
         }
     }
 }
@@ -70,11 +75,24 @@ impl Event {
 const MAX_CONNECTIONS_PER_IP: usize = 8;
 const PRUNE_THRESHOLD: usize = 10_000;
 
-/// In-memory, per-address sliding-window limits. IPv6 addresses are grouped
-/// by /64, since a single subscriber usually controls a whole /64.
+/// Who a limit applies to: a network address or a logged-in user.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Subject {
+    Ip(IpAddr),
+    User(i64),
+}
+
+impl Subject {
+    pub fn ip(ip: IpAddr) -> Self {
+        Subject::Ip(bucket(ip))
+    }
+}
+
+/// In-memory sliding-window limits. IPv6 addresses are grouped by /64, since
+/// a single subscriber usually controls a whole /64.
 #[derive(Default)]
 pub struct Limiter {
-    events: Mutex<HashMap<(IpAddr, Event), Vec<Instant>>>,
+    events: Mutex<HashMap<(Subject, Event), Vec<Instant>>>,
     connections: Mutex<HashMap<IpAddr, usize>>,
 }
 
@@ -90,28 +108,28 @@ fn bucket(ip: IpAddr) -> IpAddr {
 }
 
 impl Limiter {
-    /// True if `ip` is still under the limit for `event`.
-    pub fn allowed(&self, ip: IpAddr, event: Event) -> bool {
+    /// True if `subject` is still under the limit for `event`.
+    pub fn allowed(&self, subject: Subject, event: Event) -> bool {
         let (max, window) = event.limit();
         let now = Instant::now();
         let events = self.events.lock().unwrap_or_else(|e| e.into_inner());
-        events.get(&(bucket(ip), event)).map_or(true, |hits| {
+        events.get(&(subject, event)).map_or(true, |hits| {
             hits.iter().filter(|t| now.duration_since(**t) < window).count() < max
         })
     }
 
-    pub fn record(&self, ip: IpAddr, event: Event) {
+    pub fn record(&self, subject: Subject, event: Event) {
         let (_, window) = event.limit();
         let now = Instant::now();
         let mut events = self.events.lock().unwrap_or_else(|e| e.into_inner());
-        events.entry((bucket(ip), event)).or_default().push(now);
+        events.entry((subject, event)).or_default().push(now);
         if events.len() > PRUNE_THRESHOLD {
             events.retain(|(_, ev), hits| {
                 let (_, window) = ev.limit();
                 hits.retain(|t| now.duration_since(*t) < window);
                 !hits.is_empty()
             });
-        } else if let Some(hits) = events.get_mut(&(bucket(ip), event)) {
+        } else if let Some(hits) = events.get_mut(&(subject, event)) {
             hits.retain(|t| now.duration_since(*t) < window);
         }
     }

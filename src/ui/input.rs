@@ -19,6 +19,8 @@ pub enum Key {
     Right,
     Home,
     End,
+    PageUp,
+    PageDown,
 }
 
 /// Turns the raw byte stream from the SSH channel into `Key`s.
@@ -60,6 +62,8 @@ fn parse_escape(s: &[u8]) -> Escape {
                         (b'~', b"1" | b"7") => Some(Key::Home),
                         (b'~', b"4" | b"8") => Some(Key::End),
                         (b'~', b"3") => Some(Key::Delete),
+                        (b'~', b"5") => Some(Key::PageUp),
+                        (b'~', b"6") => Some(Key::PageDown),
                         _ => None,
                     };
                     return Escape::Done(key, i + 1);
@@ -279,6 +283,7 @@ mod tests {
         assert_eq!(p.feed(b"\x1b"), vec![Key::Esc]);
         assert_eq!(p.feed(b"\x1bOA"), vec![Key::Up]);
         assert_eq!(p.feed(b"\x1b[3~"), vec![Key::Delete]);
+        assert_eq!(p.feed(b"\x1b[5~\x1b[6~"), vec![Key::PageUp, Key::PageDown]);
     }
 
     #[test]

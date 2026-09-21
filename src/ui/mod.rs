@@ -1,6 +1,9 @@
+mod boards;
+mod compose;
 mod input;
 mod keys;
 mod register;
+mod text;
 
 use std::collections::VecDeque;
 
@@ -10,6 +13,10 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap};
 
 use crate::state::Identity;
+use boards::{
+    BoardList, BoardsEvent, ThreadEvent, ThreadList, ThreadView, ThreadsEvent,
+};
+use compose::{Compose, ComposeEvent};
 use input::{Key, KeyParser};
 use keys::{KeysEvent, KeysScreen};
 use register::{FormEvent, RegisterForm};
@@ -25,6 +32,13 @@ pub enum Request {
     ListKeys,
     AddKey(String),
     DeleteKey(i64),
+    ListBoards,
+    ListThreads { board_id: i64 },
+    OpenThread { thread_id: i64 },
+    /// `title` and `body` are already sanitised by the UI, and are
+    /// sanitised again by the server.
+    CreateThread { board_id: i64, title: String, body: String },
+    Reply { thread_id: i64, body: String },
 }
 
 pub enum Response {
@@ -34,6 +48,46 @@ pub enum Response {
         /// Outcome of the add/delete that triggered this refresh, if any.
         notice: Option<Result<String, String>>,
     },
+    Boards(Vec<BoardInfo>),
+    Threads {
+        board_name: String,
+        threads: Vec<ThreadInfo>,
+    },
+    /// `to_end` scrolls to the newest post (used after posting).
+    Thread { detail: ThreadDetail, to_end: bool },
+    /// A post was rejected; the compose screen stays open.
+    PostFailed(String),
+    /// Something couldn't be loaded.
+    Error(String),
+}
+
+pub struct BoardInfo {
+    pub id: i64,
+    pub name: String,
+    pub description: String,
+    pub thread_count: i64,
+}
+
+pub struct ThreadInfo {
+    pub id: i64,
+    pub title: String,
+    pub author: String,
+    pub post_count: i64,
+    pub last_post: String,
+}
+
+pub struct PostInfo {
+    pub author: String,
+    pub body: String,
+    pub created: String,
+}
+
+pub struct ThreadDetail {
+    pub id: i64,
+    pub board_id: i64,
+    pub board_name: String,
+    pub title: String,
+    pub posts: Vec<PostInfo>,
 }
 
 pub struct KeyInfo {
@@ -60,7 +114,7 @@ enum MenuItem {
 impl MenuItem {
     fn label(self) -> &'static str {
         match self {
-            MenuItem::Board => "Message board (coming soon)",
+            MenuItem::Board => "Message boards",
             MenuItem::Online => "Who's online (coming soon)",
             MenuItem::Register => "Register an account",
             MenuItem::Keys => "SSH keys",
@@ -75,6 +129,16 @@ enum Screen {
     About,
     Register(RegisterForm),
     Keys(KeysScreen),
+    Boards(BoardList),
+    Threads(ThreadList),
+    Thread(ThreadView),
+    Compose(Box<ComposeScreen>),
+}
+
+/// The compose screen remembers what to return to if it's cancelled.
+struct ComposeScreen {
+    compose: Compose,
+    back: Screen,
 }
 
 struct Status {
@@ -160,6 +224,33 @@ impl App {
                     form.fail(message);
                 }
             }
+            Response::Boards(boards) => {
+                if let Screen::Boards(list) = &mut self.screen {
+                    list.set(boards);
+                }
+            }
+            Response::Threads {
+                board_name,
+                threads,
+            } => {
+                if let Screen::Threads(list) = &mut self.screen {
+                    list.set(board_name, threads);
+                }
+            }
+            Response::Thread { detail, to_end } => {
+                // Also arrives after a successful post, when the compose
+                // screen is still up; the thread replaces it.
+                if to_end {
+                    self.set_status("Posted.", false);
+                }
+                self.screen = Screen::Thread(ThreadView::from_detail(detail, to_end));
+            }
+            Response::PostFailed(message) => {
+                if let Screen::Compose(screen) = &mut self.screen {
+                    screen.compose.fail(message);
+                }
+            }
+            Response::Error(message) => self.set_status(message, true),
             Response::Keys { keys, notice } => {
                 let ok = !matches!(notice, Some(Err(_)));
                 if let Screen::Keys(screen) = &mut self.screen {
@@ -199,6 +290,54 @@ impl App {
                     Some(Action::Request(Request::Register { username, password }))
                 }
             },
+            Screen::Boards(list) => match list.handle(key) {
+                BoardsEvent::None => None,
+                BoardsEvent::Back => {
+                    self.screen = Screen::Menu;
+                    None
+                }
+                BoardsEvent::Open(board_id) => {
+                    self.screen = Screen::Threads(ThreadList::loading(board_id));
+                    Some(Action::Request(Request::ListThreads { board_id }))
+                }
+            },
+            Screen::Threads(list) => match list.handle(key) {
+                ThreadsEvent::None => None,
+                ThreadsEvent::Back => {
+                    self.screen = Screen::Boards(BoardList::new());
+                    Some(Action::Request(Request::ListBoards))
+                }
+                ThreadsEvent::Open {
+                    board_id,
+                    thread_id,
+                } => {
+                    self.screen = Screen::Thread(ThreadView::loading(board_id, thread_id));
+                    Some(Action::Request(Request::OpenThread { thread_id }))
+                }
+                ThreadsEvent::New { board_id } => self.start_compose(Compose::new_thread(board_id)),
+            },
+            Screen::Thread(view) => match view.handle(key) {
+                ThreadEvent::None => None,
+                ThreadEvent::Back { board_id } => {
+                    self.screen = Screen::Threads(ThreadList::loading(board_id));
+                    Some(Action::Request(Request::ListThreads { board_id }))
+                }
+                ThreadEvent::Reply { thread_id, title } => {
+                    self.start_compose(Compose::reply(thread_id, &title))
+                }
+            },
+            Screen::Compose(screen) => match screen.compose.handle(key) {
+                ComposeEvent::None => None,
+                ComposeEvent::Cancel => {
+                    if let Screen::Compose(screen) =
+                        std::mem::replace(&mut self.screen, Screen::Menu)
+                    {
+                        self.screen = screen.back;
+                    }
+                    None
+                }
+                ComposeEvent::Submit(request) => Some(Action::Request(request)),
+            },
             Screen::Keys(screen) => match screen.handle(key) {
                 KeysEvent::None => None,
                 KeysEvent::Back => {
@@ -209,6 +348,21 @@ impl App {
                 KeysEvent::Delete(id) => Some(Action::Request(Request::DeleteKey(id))),
             },
         }
+    }
+
+    /// Opens the editor on top of the current screen. Guests can read but
+    /// not post.
+    fn start_compose(&mut self, compose: Compose) -> Option<Action> {
+        if matches!(self.identity, Identity::Guest) {
+            self.set_status(
+                "Guests can't post. Register an account from the main menu first.",
+                true,
+            );
+            return None;
+        }
+        let back = std::mem::replace(&mut self.screen, Screen::Menu);
+        self.screen = Screen::Compose(Box::new(ComposeScreen { compose, back }));
+        None
     }
 
     fn handle_menu_key(&mut self, key: Key) -> Option<Action> {
@@ -232,9 +386,11 @@ impl App {
 
     fn activate(&mut self) -> Option<Action> {
         match self.menu_items()[self.selected] {
-            MenuItem::Board | MenuItem::Online => {
-                self.set_status("Not implemented yet.", false);
+            MenuItem::Board => {
+                self.screen = Screen::Boards(BoardList::new());
+                return Some(Action::Request(Request::ListBoards));
             }
+            MenuItem::Online => self.set_status("Not implemented yet.", false),
             MenuItem::Register => self.screen = Screen::Register(RegisterForm::new()),
             MenuItem::Keys => {
                 self.screen = Screen::Keys(KeysScreen::new());
@@ -263,6 +419,10 @@ impl App {
             Screen::About => Self::draw_about(frame, body),
             Screen::Register(form) => form.draw(frame, body),
             Screen::Keys(screen) => screen.draw(frame, body),
+            Screen::Boards(list) => list.draw(frame, body),
+            Screen::Threads(list) => list.draw(frame, body),
+            Screen::Thread(view) => view.draw(frame, body),
+            Screen::Compose(screen) => screen.compose.draw(frame, body),
         }
         self.draw_status(frame, chunks[2]);
     }

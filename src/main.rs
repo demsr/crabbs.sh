@@ -1,4 +1,6 @@
 mod auth;
+mod boards;
+mod content;
 mod db;
 mod server;
 mod state;

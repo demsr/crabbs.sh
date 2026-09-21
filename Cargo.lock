@@ -1880,6 +1880,7 @@ dependencies = [
  "rusqlite",
  "russh",
  "tokio",
+ "unicode-width",
 ]
 
 [[package]]
