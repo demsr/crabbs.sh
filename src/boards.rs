@@ -4,7 +4,7 @@
 use std::sync::Arc;
 
 use crate::content;
-use crate::db::{DbError, MAX_POSTS_PER_THREAD};
+use crate::db::{DbError, MAX_POSTS_PER_THREAD, Role};
 use crate::state::{Event, Identity, Shared, Subject};
 use crate::ui::{BoardInfo, PostInfo, Response, ThreadDetail, ThreadInfo};
 
@@ -27,7 +27,11 @@ pub async fn list_boards(shared: &Arc<Shared>) -> Response {
     }
 }
 
-pub async fn list_threads(shared: &Arc<Shared>, board_id: i64) -> Response {
+pub async fn list_threads(
+    shared: &Arc<Shared>,
+    board_id: i64,
+    notice: Option<String>,
+) -> Response {
     let result = shared
         .blocking(move |s| {
             let name = s.db.board_name(board_id)?;
@@ -39,6 +43,8 @@ pub async fn list_threads(shared: &Arc<Shared>, board_id: i64) -> Response {
         .await;
     match result {
         Ok(Some((board_name, threads))) => Response::Threads {
+            board_id,
+            notice,
             board_name,
             threads: threads
                 .into_iter()
@@ -56,7 +62,12 @@ pub async fn list_threads(shared: &Arc<Shared>, board_id: i64) -> Response {
     }
 }
 
-pub async fn open_thread(shared: &Arc<Shared>, thread_id: i64, to_end: bool) -> Response {
+pub async fn open_thread(
+    shared: &Arc<Shared>,
+    thread_id: i64,
+    to_end: bool,
+    notice: Option<String>,
+) -> Response {
     let result = shared
         .blocking(move |s| {
             let Some(head) = s.db.thread_head(thread_id)? else {
@@ -67,6 +78,7 @@ pub async fn open_thread(shared: &Arc<Shared>, thread_id: i64, to_end: bool) -> 
         .await;
     match result {
         Ok(Some((head, posts))) => Response::Thread {
+            notice,
             detail: ThreadDetail {
                 id: head.id,
                 board_id: head.board_id,
@@ -75,7 +87,9 @@ pub async fn open_thread(shared: &Arc<Shared>, thread_id: i64, to_end: bool) -> 
                 posts: posts
                     .into_iter()
                     .map(|p| PostInfo {
+                        id: p.id,
                         author: p.author,
+                        author_is_sysop: p.author_is_sysop,
                         body: p.body,
                         created: p.created,
                     })
@@ -88,19 +102,46 @@ pub async fn open_thread(shared: &Arc<Shared>, thread_id: i64, to_end: bool) -> 
     }
 }
 
-/// Only registered users may post, and not too often.
-fn check_can_post(shared: &Shared, identity: &Identity, thread_start: bool) -> Result<i64, String> {
+/// Reads the user's current account state; roles and bans can be changed at
+/// any time by the admin tool, so this is never taken from the session.
+async fn live_account(shared: &Arc<Shared>, identity: &Identity) -> Result<crate::db::Account, String> {
     let Identity::User { id, .. } = identity else {
-        return Err("Guests can't post. Register an account first.".into());
+        return Err("Guests can't do that. Register an account first.".into());
     };
-    let subject = Subject::User(*id);
+    let id = *id;
+    match shared.blocking(move |s| s.db.account(id)).await {
+        Ok(Some(account)) if account.banned => Err("Your account has been suspended.".into()),
+        Ok(Some(account)) => Ok(account),
+        Ok(None) => Err("Your account no longer exists.".into()),
+        Err(_) => Err(INTERNAL_ERROR.into()),
+    }
+}
+
+/// Only sysops may moderate.
+async fn require_sysop(shared: &Arc<Shared>, identity: &Identity) -> Result<(), String> {
+    match live_account(shared, identity).await? {
+        account if account.role == Role::Sysop => Ok(()),
+        _ => Err("Only sysops can do that.".into()),
+    }
+}
+
+/// Only registered, non-suspended users may post, and not too often.
+async fn check_can_post(
+    shared: &Arc<Shared>,
+    identity: &Identity,
+    thread_start: bool,
+) -> Result<i64, String> {
+    let account = live_account(shared, identity)
+        .await
+        .map_err(|e| e.replace("do that", "post"))?;
+    let subject = Subject::User(account.id);
     let limiter = &shared.limiter;
     if !limiter.allowed(subject, Event::Post)
         || (thread_start && !limiter.allowed(subject, Event::NewThread))
     {
         return Err("You're posting too fast. Please wait a few minutes.".into());
     }
-    Ok(*id)
+    Ok(account.id)
 }
 
 fn record_post(shared: &Shared, user_id: i64, thread_start: bool) {
@@ -129,7 +170,7 @@ pub async fn create_thread(
     title: String,
     body: String,
 ) -> Response {
-    let user_id = match check_can_post(shared, identity, true) {
+    let user_id = match check_can_post(shared, identity, true).await {
         Ok(id) => id,
         Err(e) => return Response::PostFailed(e),
     };
@@ -143,7 +184,7 @@ pub async fn create_thread(
         .blocking(move |s| s.db.create_thread(board_id, user_id, &title, &body))
         .await
     {
-        Ok(thread_id) => open_thread(shared, thread_id, true).await,
+        Ok(thread_id) => open_thread(shared, thread_id, true, Some("Posted.".into())).await,
         Err(err) => post_error(err, "board"),
     }
 }
@@ -154,7 +195,7 @@ pub async fn reply(
     thread_id: i64,
     body: String,
 ) -> Response {
-    let user_id = match check_can_post(shared, identity, false) {
+    let user_id = match check_can_post(shared, identity, false).await {
         Ok(id) => id,
         Err(e) => return Response::PostFailed(e),
     };
@@ -168,7 +209,37 @@ pub async fn reply(
         .blocking(move |s| s.db.add_post(thread_id, user_id, &body))
         .await
     {
-        Ok(()) => open_thread(shared, thread_id, true).await,
+        Ok(()) => open_thread(shared, thread_id, true, Some("Posted.".into())).await,
         Err(err) => post_error(err, "thread"),
+    }
+}
+
+pub async fn delete_thread(shared: &Arc<Shared>, identity: &Identity, thread_id: i64) -> Response {
+    if let Err(e) = require_sysop(shared, identity).await {
+        return Response::Error(e);
+    }
+    match shared.blocking(move |s| s.db.delete_thread(thread_id)).await {
+        Ok(board_id) => list_threads(shared, board_id, Some("Thread deleted.".into())).await,
+        Err(DbError::NotFound) => Response::Error("That thread no longer exists.".into()),
+        Err(_) => Response::Error(INTERNAL_ERROR.into()),
+    }
+}
+
+pub async fn delete_post(shared: &Arc<Shared>, identity: &Identity, post_id: i64) -> Response {
+    if let Err(e) = require_sysop(shared, identity).await {
+        return Response::Error(e);
+    }
+    match shared.blocking(move |s| s.db.delete_post(post_id)).await {
+        Ok(d) if d.thread_deleted => {
+            list_threads(
+                shared,
+                d.board_id,
+                Some("Post deleted; the thread is gone too.".into()),
+            )
+            .await
+        }
+        Ok(d) => open_thread(shared, d.thread_id, false, Some("Post deleted.".into())).await,
+        Err(DbError::NotFound) => Response::Error("That post no longer exists.".into()),
+        Err(_) => Response::Error(INTERNAL_ERROR.into()),
     }
 }

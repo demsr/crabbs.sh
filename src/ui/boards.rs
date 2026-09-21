@@ -141,6 +141,7 @@ impl BoardList {
 pub enum ThreadsEvent {
     None,
     Back,
+    DeleteThread { thread_id: i64 },
     Open { board_id: i64, thread_id: i64 },
     New { board_id: i64 },
 }
@@ -151,11 +152,16 @@ pub struct ThreadList {
     threads: Vec<ThreadInfo>,
     selected: usize,
     loaded: bool,
+    /// Shows moderation keys. Purely cosmetic: the server decides.
+    sysop: bool,
+    confirm_delete: bool,
 }
 
 impl ThreadList {
-    pub fn loading(board_id: i64) -> Self {
+    pub fn loading(board_id: i64, sysop: bool) -> Self {
         Self {
+            sysop,
+            confirm_delete: false,
             board_id,
             board_name: String::new(),
             threads: Vec::new(),
@@ -172,7 +178,19 @@ impl ThreadList {
     }
 
     pub fn handle(&mut self, key: Key) -> ThreadsEvent {
+        if self.confirm_delete {
+            self.confirm_delete = false;
+            if let (Key::Char('y'), Some(thread)) = (key, self.threads.get(self.selected)) {
+                return ThreadsEvent::DeleteThread {
+                    thread_id: thread.id,
+                };
+            }
+            return ThreadsEvent::None;
+        }
         match key {
+            Key::Char('x') if self.sysop && !self.threads.is_empty() => {
+                self.confirm_delete = true;
+            }
             Key::Esc | Key::Char('q') => return ThreadsEvent::Back,
             Key::Char('n') => {
                 return ThreadsEvent::New {
@@ -226,11 +244,31 @@ impl ThreadList {
             state.select(Some(self.selected));
         }
         frame.render_stateful_widget(list, body, &mut state);
-        draw_help(
-            frame,
-            help,
-            "Enter: read · n: new thread · ↑/↓: move · Esc: back",
-        );
+        if self.confirm_delete {
+            let title = self
+                .threads
+                .get(self.selected)
+                .map_or("", |t| t.title.as_str());
+            frame.render_widget(
+                Paragraph::new(format!(
+                    "Delete thread \"{title}\" and all its posts? y = yes, any other key = no"
+                ))
+                .style(Style::new().fg(Color::Yellow)),
+                help,
+            );
+        } else if self.sysop {
+            draw_help(
+                frame,
+                help,
+                "Enter: read · n: new thread · x: delete thread (sysop) · Esc: back",
+            );
+        } else {
+            draw_help(
+                frame,
+                help,
+                "Enter: read · n: new thread · ↑/↓: move · Esc: back",
+            );
+        }
     }
 }
 
@@ -238,6 +276,7 @@ impl ThreadList {
 
 pub enum ThreadEvent {
     None,
+    DeletePost { post_id: i64 },
     Back { board_id: i64 },
     Reply { thread_id: i64, title: String },
 }
@@ -249,6 +288,9 @@ pub struct ThreadView {
     title: String,
     posts: Vec<super::PostInfo>,
     loaded: bool,
+    sysop: bool,
+    /// Digits typed so far while asking which post to delete.
+    delete_prompt: Option<String>,
     /// First visible line. A `Counter` (interior mutability) because drawing clamps it to the
     /// content height, which is only known at draw time.
     scroll: Counter,
@@ -257,8 +299,10 @@ pub struct ThreadView {
 }
 
 impl ThreadView {
-    pub fn loading(board_id: i64, thread_id: i64) -> Self {
+    pub fn loading(board_id: i64, thread_id: i64, sysop: bool) -> Self {
         Self {
+            sysop,
+            delete_prompt: None,
             board_id,
             thread_id,
             board_name: String::new(),
@@ -271,8 +315,8 @@ impl ThreadView {
         }
     }
 
-    pub fn from_detail(detail: ThreadDetail, to_end: bool) -> Self {
-        let mut view = Self::loading(detail.board_id, detail.id);
+    pub fn from_detail(detail: ThreadDetail, to_end: bool, sysop: bool) -> Self {
+        let mut view = Self::loading(detail.board_id, detail.id, sysop);
         view.board_name = detail.board_name;
         view.title = detail.title;
         view.posts = detail.posts;
@@ -293,13 +337,39 @@ impl ThreadView {
         self.scroll.set(now.saturating_add_signed(delta).min(max));
     }
 
+    fn handle_delete_prompt(&mut self, mut input: String, key: Key) -> ThreadEvent {
+        match key {
+            Key::Esc => return ThreadEvent::None,
+            Key::Enter => {
+                let number: usize = input.parse().unwrap_or(0);
+                return match number.checked_sub(1).and_then(|i| self.posts.get(i)) {
+                    Some(post) => ThreadEvent::DeletePost { post_id: post.id },
+                    None => ThreadEvent::None,
+                };
+            }
+            Key::Backspace => {
+                input.pop();
+            }
+            Key::Char(c) if c.is_ascii_digit() && input.len() < 6 => input.push(c),
+            _ => {}
+        }
+        self.delete_prompt = Some(input);
+        ThreadEvent::None
+    }
+
     pub fn handle(&mut self, key: Key) -> ThreadEvent {
+        if let Some(input) = self.delete_prompt.take() {
+            return self.handle_delete_prompt(input, key);
+        }
         let page = self.page_height.get().saturating_sub(1).max(1) as isize;
         match key {
             Key::Esc | Key::Char('q') => {
                 return ThreadEvent::Back {
                     board_id: self.board_id,
                 };
+            }
+            Key::Char('x') if self.sysop && self.loaded => {
+                self.delete_prompt = Some(String::new());
             }
             Key::Char('r') if self.loaded => {
                 return ThreadEvent::Reply {
@@ -337,6 +407,10 @@ impl ThreadView {
                         .fg(Color::Cyan)
                         .add_modifier(Modifier::BOLD),
                 ),
+                Span::styled(
+                    if post.author_is_sysop { " [sysop]" } else { "" },
+                    Style::default().fg(Color::Yellow),
+                ),
                 Span::styled(format!("  {}", post.created), DIM),
             ]));
             lines.extend(
@@ -359,10 +433,26 @@ impl ThreadView {
                 .scroll((scroll.min(u16::MAX as usize) as u16, 0)),
             body,
         );
-        draw_help(
-            frame,
-            help,
-            "↑/↓/PgUp/PgDn: scroll · r: reply · Esc: back to threads",
-        );
+        if let Some(input) = &self.delete_prompt {
+            let label = "Delete which post number? ";
+            frame.render_widget(
+                Paragraph::new(format!("{label}{input}   (Enter: delete · Esc: cancel)"))
+                    .style(Style::new().fg(Color::Yellow)),
+                help,
+            );
+            frame.set_cursor_position((help.x + (label.len() + input.len()) as u16, help.y));
+        } else if self.sysop {
+            draw_help(
+                frame,
+                help,
+                "↑/↓/PgUp/PgDn: scroll · r: reply · x: delete post (sysop) · Esc: back",
+            );
+        } else {
+            draw_help(
+                frame,
+                help,
+                "↑/↓/PgUp/PgDn: scroll · r: reply · Esc: back to threads",
+            );
+        }
     }
 }

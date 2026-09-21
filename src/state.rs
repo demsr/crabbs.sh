@@ -1,10 +1,13 @@
 use std::collections::HashMap;
 use std::net::IpAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use russh::server::Handle;
 use tokio::sync::Semaphore;
 
+pub use crate::db::Role;
 use crate::db::Db;
 
 /// Who a session is acting as. This is BBS-level identity, separate from the
@@ -13,10 +16,16 @@ use crate::db::Db;
 #[derive(Clone, Debug)]
 pub enum Identity {
     Guest,
-    User { id: i64, name: String },
+    User { id: i64, name: String, role: Role },
 }
 
 impl Identity {
+    /// For display only. Anything that grants power must re-check the
+    /// database, since roles can be changed while a session is running.
+    pub fn is_sysop(&self) -> bool {
+        matches!(self, Identity::User { role: Role::Sysop, .. })
+    }
+
     pub fn display_name(&self) -> &str {
         match self {
             Identity::Guest => "guest",
@@ -33,6 +42,7 @@ pub struct Shared {
     /// flood of login attempts can't exhaust memory.
     pub hash_slots: Semaphore,
     pub limiter: Arc<Limiter>,
+    pub online: Arc<Online>,
     /// Verified against when a username doesn't exist, so unknown and known
     /// users take equally long to reject.
     pub dummy_hash: String,
@@ -172,5 +182,96 @@ impl Drop for ConnectionGuard {
                 conns.remove(&self.ip);
             }
         }
+    }
+}
+
+// ---------------------------------------------------------------- online
+
+/// A connected session, as shown on the "Who's online" screen.
+pub struct OnlineEntry {
+    pub name: String,
+    /// `None` for guests.
+    pub user_id: Option<i64>,
+    pub role: Role,
+    pub since: Instant,
+    /// What the session is currently doing, e.g. "Reading boards".
+    pub activity: &'static str,
+    /// Lets the server end the session (e.g. when the user gets banned).
+    pub handle: Handle,
+}
+
+pub struct OnlineUser {
+    pub name: String,
+    pub user_id: Option<i64>,
+    pub role: Role,
+    pub connected: Duration,
+    pub activity: &'static str,
+}
+
+/// Registry of live sessions. Sessions add themselves with `join` and are
+/// removed automatically when the returned guard is dropped.
+#[derive(Default)]
+pub struct Online {
+    next_id: AtomicU64,
+    entries: Mutex<HashMap<u64, OnlineEntry>>,
+}
+
+impl Online {
+    fn entries(&self) -> std::sync::MutexGuard<'_, HashMap<u64, OnlineEntry>> {
+        self.entries.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    pub fn join(self: &Arc<Self>, entry: OnlineEntry) -> OnlineGuard {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        self.entries().insert(id, entry);
+        OnlineGuard {
+            online: Arc::clone(self),
+            id,
+        }
+    }
+
+    pub fn snapshot(&self) -> Vec<OnlineUser> {
+        let now = Instant::now();
+        let mut users: Vec<OnlineUser> = self
+            .entries()
+            .values()
+            .map(|e| OnlineUser {
+                name: e.name.clone(),
+                user_id: e.user_id,
+                role: e.role,
+                connected: now.duration_since(e.since),
+                activity: e.activity,
+            })
+            .collect();
+        users.sort_by(|a, b| b.connected.cmp(&a.connected));
+        users
+    }
+
+    /// Sessions of logged-in users, with a handle to end each one.
+    pub fn user_sessions(&self) -> Vec<(i64, Handle)> {
+        self.entries()
+            .values()
+            .filter_map(|e| e.user_id.map(|id| (id, e.handle.clone())))
+            .collect()
+    }
+}
+
+/// Removes the session from the registry when dropped.
+pub struct OnlineGuard {
+    online: Arc<Online>,
+    id: u64,
+}
+
+impl OnlineGuard {
+    pub fn update(&self, f: impl FnOnce(&mut OnlineEntry)) {
+        if let Some(entry) = self.online.entries().get_mut(&self.id) {
+            f(entry);
+        }
+    }
+}
+
+impl Drop for OnlineGuard {
+    fn drop(&mut self) {
+        self.online.entries().remove(&self.id);
     }
 }

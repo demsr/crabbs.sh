@@ -10,9 +10,12 @@ use russh::server::{Auth, ChannelOpenHandle, Handler, Msg, Server as ServerTrait
 use russh::{Channel, ChannelId, Pty};
 
 use crate::db::{DbError, MAX_KEYS_PER_USER};
-use crate::state::{ConnectionGuard, Event, Identity, Shared, Subject};
+use russh::Disconnect;
+use crate::state::{
+    ConnectionGuard, Event, Identity, OnlineEntry, OnlineGuard, Role, Shared, Subject,
+};
 use crate::terminal::TerminalHandle;
-use crate::ui::{Action, App, KeyInfo, Request, Response};
+use crate::ui::{Action, App, KeyInfo, OnlineInfo, Request, Response};
 use crate::{auth, boards};
 
 type SshTerminal = Terminal<CrosstermBackend<TerminalHandle>>;
@@ -48,6 +51,7 @@ impl ServerTrait for BbsServer {
             over_limit: peer_ip.is_some() && guard.is_none(),
             _guard: guard,
             identity: None,
+            online: None,
             output: None,
             terminal: None,
             app: None,
@@ -69,6 +73,8 @@ pub struct BbsHandler {
     _guard: Option<ConnectionGuard>,
     /// Set once SSH authentication succeeds; changes when a guest registers.
     identity: Option<Identity>,
+    /// Our entry in the who's-online registry (once the session is open).
+    online: Option<OnlineGuard>,
     /// Where the UI is drawn: the client's SSH channel.
     output: Option<TerminalHandle>,
     terminal: Option<SshTerminal>,
@@ -134,9 +140,10 @@ impl BbsHandler {
             .await;
 
         match (ok, record) {
-            (true, Some(r)) => Some(Identity::User {
+            (true, Some(r)) if !r.banned => Some(Identity::User {
                 id: r.id,
                 name: r.username,
+                role: r.role,
             }),
             _ => None,
         }
@@ -154,9 +161,13 @@ impl BbsHandler {
             .await
             .ok()
             .flatten()?;
+        if found.banned {
+            return None;
+        }
         Some(Identity::User {
-            id: found.0,
-            name: found.1,
+            id: found.id,
+            name: found.username,
+            role: found.role,
         })
     }
 
@@ -166,10 +177,21 @@ impl BbsHandler {
                 Response::Registered(self.register(username, password).await)
             }
             Request::ListBoards => boards::list_boards(&self.shared).await,
-            Request::ListThreads { board_id } => boards::list_threads(&self.shared, board_id).await,
-            Request::OpenThread { thread_id } => {
-                boards::open_thread(&self.shared, thread_id, false).await
+            Request::ListThreads { board_id } => {
+                boards::list_threads(&self.shared, board_id, None).await
             }
+            Request::OpenThread { thread_id } => {
+                boards::open_thread(&self.shared, thread_id, false, None).await
+            }
+            Request::WhoIsOnline => self.who_is_online(),
+            Request::DeleteThread { thread_id } => match &self.identity {
+                Some(identity) => boards::delete_thread(&self.shared, identity, thread_id).await,
+                None => Response::Error(INTERNAL_ERROR.into()),
+            },
+            Request::DeletePost { post_id } => match &self.identity {
+                Some(identity) => boards::delete_post(&self.shared, identity, post_id).await,
+                None => Response::Error(INTERNAL_ERROR.into()),
+            },
             Request::CreateThread {
                 board_id,
                 title,
@@ -202,6 +224,70 @@ impl BbsHandler {
                 self.keys_response(Some(notice)).await
             }
         }
+    }
+
+    fn who_is_online(&self) -> Response {
+        let mut users: Vec<OnlineInfo> = Vec::new();
+        let mut guests = 0;
+        for entry in self.shared.online.snapshot() {
+            // Snapshot is ordered longest-connected first, so the first
+            // entry for a user carries their real "connected since".
+            match entry.user_id {
+                None => guests += 1,
+                Some(id) => match users.iter_mut().find(|u| u.user_id == id) {
+                    Some(existing) => existing.sessions += 1,
+                    None => users.push(OnlineInfo {
+                        user_id: id,
+                        name: entry.name,
+                        is_sysop: entry.role == Role::Sysop,
+                        connected: entry.connected,
+                        activity: entry.activity,
+                        sessions: 1,
+                    }),
+                },
+            }
+        }
+        users.sort_by_key(|u| u.name.to_lowercase());
+        Response::Online { users, guests }
+    }
+
+    /// Adds this session to the who's-online registry.
+    fn join_online(&mut self, handle: russh::server::Handle) {
+        let Some(identity) = &self.identity else {
+            return;
+        };
+        let (user_id, role) = match identity {
+            Identity::Guest => (None, Role::User),
+            Identity::User { id, role, .. } => (Some(*id), *role),
+        };
+        self.online = Some(self.shared.online.join(OnlineEntry {
+            name: identity.display_name().to_string(),
+            user_id,
+            role,
+            since: std::time::Instant::now(),
+            activity: "Main menu",
+            handle,
+        }));
+    }
+
+    /// Keeps the registry entry in step with the session's identity and screen.
+    fn sync_online(&self) {
+        let (Some(guard), Some(identity), Some(app)) =
+            (&self.online, &self.identity, &self.app)
+        else {
+            return;
+        };
+        let activity = app.activity();
+        let (name, user_id, role) = match identity {
+            Identity::Guest => ("guest".to_string(), None, Role::User),
+            Identity::User { id, name, role } => (name.clone(), Some(*id), *role),
+        };
+        guard.update(|e| {
+            e.activity = activity;
+            e.name = name;
+            e.user_id = user_id;
+            e.role = role;
+        });
     }
 
     fn user_id(&self) -> Option<i64> {
@@ -254,7 +340,11 @@ impl BbsHandler {
             .await
         {
             Ok(id) => {
-                let identity = Identity::User { id, name: username };
+                let identity = Identity::User {
+                    id,
+                    name: username,
+                    role: Role::User,
+                };
                 self.identity = Some(identity.clone());
                 Ok(identity)
             }
@@ -278,7 +368,9 @@ impl BbsHandler {
             Err(DbError::LimitReached) => {
                 Err(format!("You can store at most {MAX_KEYS_PER_USER} keys."))
             }
-            Err(DbError::Other | DbError::NotFound) => Err(INTERNAL_ERROR.into()),
+            Err(DbError::Other | DbError::NotFound | DbError::NotEmpty) => {
+                Err(INTERNAL_ERROR.into())
+            }
         }
     }
 
@@ -383,6 +475,7 @@ impl Handler for BbsHandler {
         // The real size arrives with the client's pty request; start at zero.
         self.terminal = Some(self.new_terminal(Rect::default())?);
         self.app = Some(App::new(identity));
+        self.join_online(session.handle());
 
         reply.accept().await;
         Ok(())
@@ -472,7 +565,10 @@ impl Handler for BbsHandler {
                     return Ok(());
                 }
                 Action::Request(request) => {
-                    // Show any "working…" state before doing slow work.
+                    // Show any "working…" state before doing slow work, and
+                    // make sure the registry reflects the screen the request
+                    // came from (who's-online lists the requester too).
+                    self.sync_online();
                     self.redraw();
                     let response = self.serve(request).await;
                     if let Some(app) = self.app.as_mut() {
@@ -482,6 +578,7 @@ impl Handler for BbsHandler {
             }
         }
 
+        self.sync_online();
         self.redraw();
         Ok(())
     }
@@ -520,5 +617,29 @@ impl BbsHandler {
             self.terminal = Some(self.new_terminal(area)?);
         }
         Ok(())
+    }
+}
+
+/// Disconnects sessions of users who were banned while online. Bans are made
+/// through the admin tool, a separate process, so the server polls for them.
+pub async fn sweep_banned(shared: Arc<Shared>) {
+    let mut tick = tokio::time::interval(std::time::Duration::from_secs(10));
+    loop {
+        tick.tick().await;
+        for (user_id, handle) in shared.online.user_sessions() {
+            let banned = matches!(
+                shared.blocking(move |s| s.db.account(user_id)).await,
+                Ok(Some(account)) if account.banned
+            );
+            if banned {
+                let _ = handle
+                    .disconnect(
+                        Disconnect::ByApplication,
+                        "Your account has been suspended.".into(),
+                        String::new(),
+                    )
+                    .await;
+            }
+        }
     }
 }

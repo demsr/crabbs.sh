@@ -10,7 +10,7 @@ use tokio::sync::Semaphore;
 
 use rust_bbs::db::Db;
 use rust_bbs::server::BbsServer;
-use rust_bbs::state::{Limiter, Shared};
+use rust_bbs::state::{Limiter, Online, Shared};
 use rust_bbs::auth;
 
 /// Concurrent Argon2 hashes allowed (each needs ~19 MiB of memory).
@@ -46,6 +46,7 @@ async fn main() -> anyhow::Result<()> {
         guest_password,
         hash_slots: Semaphore::new(MAX_CONCURRENT_HASHES),
         limiter: Arc::new(Limiter::default()),
+        online: Arc::new(Online::default()),
         dummy_hash,
     });
 
@@ -71,6 +72,7 @@ async fn main() -> anyhow::Result<()> {
     println!("guest login: username 'guest' (password from BBS_GUEST_PASSWORD, default 'letmein')");
     println!("connect with: ssh -p {port} guest@localhost");
 
+    tokio::spawn(rust_bbs::server::sweep_banned(Arc::clone(&shared)));
     let mut server = BbsServer::new(shared);
     server.run_on_address(Arc::new(config), addr).await?;
     Ok(())

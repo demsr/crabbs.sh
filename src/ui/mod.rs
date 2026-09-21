@@ -2,6 +2,7 @@ mod boards;
 mod compose;
 mod input;
 mod keys;
+mod online;
 mod register;
 mod text;
 
@@ -17,6 +18,7 @@ use boards::{BoardList, BoardsEvent, ThreadEvent, ThreadList, ThreadView, Thread
 use compose::{Compose, ComposeEvent};
 use input::{Key, KeyParser};
 use keys::{KeysEvent, KeysScreen};
+use online::{OnlineEvent, OnlineScreen};
 use register::{FormEvent, RegisterForm};
 
 /// Cap on buffered, not-yet-processed keystrokes.
@@ -34,8 +36,17 @@ pub enum Request {
     AddKey(String),
     DeleteKey(i64),
     ListBoards,
+    WhoIsOnline,
     ListThreads {
         board_id: i64,
+    },
+    /// Sysop-only; the server checks.
+    DeleteThread {
+        thread_id: i64,
+    },
+    /// Sysop-only; the server checks.
+    DeletePost {
+        post_id: i64,
     },
     OpenThread {
         thread_id: i64,
@@ -62,13 +73,20 @@ pub enum Response {
     },
     Boards(Vec<BoardInfo>),
     Threads {
+        board_id: i64,
         board_name: String,
         threads: Vec<ThreadInfo>,
+        notice: Option<String>,
     },
     /// `to_end` scrolls to the newest post (used after posting).
     Thread {
         detail: ThreadDetail,
         to_end: bool,
+        notice: Option<String>,
+    },
+    Online {
+        users: Vec<OnlineInfo>,
+        guests: usize,
     },
     /// A post was rejected; the compose screen stays open.
     PostFailed(String),
@@ -91,8 +109,19 @@ pub struct ThreadInfo {
     pub last_post: String,
 }
 
+pub struct OnlineInfo {
+    pub user_id: i64,
+    pub name: String,
+    pub is_sysop: bool,
+    pub connected: std::time::Duration,
+    pub activity: &'static str,
+    pub sessions: usize,
+}
+
 pub struct PostInfo {
+    pub id: i64,
     pub author: String,
+    pub author_is_sysop: bool,
     pub body: String,
     pub created: String,
 }
@@ -130,7 +159,7 @@ impl MenuItem {
     fn label(self) -> &'static str {
         match self {
             MenuItem::Board => "Message boards",
-            MenuItem::Online => "Who's online (coming soon)",
+            MenuItem::Online => "Who's online",
             MenuItem::Register => "Register an account",
             MenuItem::Keys => "SSH keys",
             MenuItem::About => "About this BBS",
@@ -148,6 +177,7 @@ enum Screen {
     Threads(ThreadList),
     Thread(ThreadView),
     Compose(Box<ComposeScreen>),
+    Online(OnlineScreen),
 }
 
 /// The compose screen remembers what to return to if it's cancelled.
@@ -182,6 +212,20 @@ impl App {
             }),
             parser: KeyParser::default(),
             queue: VecDeque::new(),
+        }
+    }
+
+    /// What the session is doing, for the who's-online list.
+    pub fn activity(&self) -> &'static str {
+        match self.screen {
+            Screen::Menu | Screen::About => "Main menu",
+            Screen::Register(_) => "Registering",
+            Screen::Keys(_) => "Managing SSH keys",
+            Screen::Boards(_) => "Browsing boards",
+            Screen::Threads(_) => "Browsing threads",
+            Screen::Thread(_) => "Reading a thread",
+            Screen::Compose(_) => "Writing a post",
+            Screen::Online(_) => "Checking who's online",
         }
     }
 
@@ -245,20 +289,40 @@ impl App {
                 }
             }
             Response::Threads {
+                board_id,
                 board_name,
                 threads,
+                notice,
             } => {
-                if let Screen::Threads(list) = &mut self.screen {
-                    list.set(board_name, threads);
+                // Replaces whatever is showing: this also answers a deleted
+                // post that took its whole thread with it.
+                let mut list = ThreadList::loading(board_id, self.identity.is_sysop());
+                list.set(board_name, threads);
+                self.screen = Screen::Threads(list);
+                if let Some(text) = notice {
+                    self.set_status(text, false);
                 }
             }
-            Response::Thread { detail, to_end } => {
+            Response::Thread {
+                detail,
+                to_end,
+                notice,
+            } => {
                 // Also arrives after a successful post, when the compose
                 // screen is still up; the thread replaces it.
-                if to_end {
-                    self.set_status("Posted.", false);
+                self.screen = Screen::Thread(ThreadView::from_detail(
+                    detail,
+                    to_end,
+                    self.identity.is_sysop(),
+                ));
+                if let Some(text) = notice {
+                    self.set_status(text, false);
                 }
-                self.screen = Screen::Thread(ThreadView::from_detail(detail, to_end));
+            }
+            Response::Online { users, guests } => {
+                if let Screen::Online(screen) = &mut self.screen {
+                    screen.set(users, guests);
+                }
             }
             Response::PostFailed(message) => {
                 if let Screen::Compose(screen) = &mut self.screen {
@@ -289,6 +353,7 @@ impl App {
 
     fn handle_key(&mut self, key: Key) -> Option<Action> {
         self.status = None;
+        let sysop = self.identity.is_sysop();
         match &mut self.screen {
             Screen::Menu => self.handle_menu_key(key),
             Screen::About => {
@@ -312,12 +377,15 @@ impl App {
                     None
                 }
                 BoardsEvent::Open(board_id) => {
-                    self.screen = Screen::Threads(ThreadList::loading(board_id));
+                    self.screen = Screen::Threads(ThreadList::loading(board_id, sysop));
                     Some(Action::Request(Request::ListThreads { board_id }))
                 }
             },
             Screen::Threads(list) => match list.handle(key) {
                 ThreadsEvent::None => None,
+                ThreadsEvent::DeleteThread { thread_id } => {
+                    Some(Action::Request(Request::DeleteThread { thread_id }))
+                }
                 ThreadsEvent::Back => {
                     self.screen = Screen::Boards(BoardList::new());
                     Some(Action::Request(Request::ListBoards))
@@ -326,15 +394,18 @@ impl App {
                     board_id,
                     thread_id,
                 } => {
-                    self.screen = Screen::Thread(ThreadView::loading(board_id, thread_id));
+                    self.screen = Screen::Thread(ThreadView::loading(board_id, thread_id, sysop));
                     Some(Action::Request(Request::OpenThread { thread_id }))
                 }
                 ThreadsEvent::New { board_id } => self.start_compose(Compose::new_thread(board_id)),
             },
             Screen::Thread(view) => match view.handle(key) {
                 ThreadEvent::None => None,
+                ThreadEvent::DeletePost { post_id } => {
+                    Some(Action::Request(Request::DeletePost { post_id }))
+                }
                 ThreadEvent::Back { board_id } => {
-                    self.screen = Screen::Threads(ThreadList::loading(board_id));
+                    self.screen = Screen::Threads(ThreadList::loading(board_id, sysop));
                     Some(Action::Request(Request::ListThreads { board_id }))
                 }
                 ThreadEvent::Reply { thread_id, title } => {
@@ -352,6 +423,14 @@ impl App {
                     None
                 }
                 ComposeEvent::Submit(request) => Some(Action::Request(request)),
+            },
+            Screen::Online(screen) => match screen.handle(key) {
+                OnlineEvent::None => None,
+                OnlineEvent::Back => {
+                    self.screen = Screen::Menu;
+                    None
+                }
+                OnlineEvent::Refresh => Some(Action::Request(Request::WhoIsOnline)),
             },
             Screen::Keys(screen) => match screen.handle(key) {
                 KeysEvent::None => None,
@@ -405,7 +484,10 @@ impl App {
                 self.screen = Screen::Boards(BoardList::new());
                 return Some(Action::Request(Request::ListBoards));
             }
-            MenuItem::Online => self.set_status("Not implemented yet.", false),
+            MenuItem::Online => {
+                self.screen = Screen::Online(OnlineScreen::new());
+                return Some(Action::Request(Request::WhoIsOnline));
+            }
             MenuItem::Register => self.screen = Screen::Register(RegisterForm::new()),
             MenuItem::Keys => {
                 self.screen = Screen::Keys(KeysScreen::new());
@@ -438,6 +520,7 @@ impl App {
             Screen::Threads(list) => list.draw(frame, body),
             Screen::Thread(view) => view.draw(frame, body),
             Screen::Compose(screen) => screen.compose.draw(frame, body),
+            Screen::Online(screen) => screen.draw(frame, body),
         }
         self.draw_status(frame, chunks[2]);
     }
