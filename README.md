@@ -49,8 +49,8 @@ case-insensitive. Passwords: 8-128 characters.
 
 Main menu → **Message boards**. Boards contain threads, threads contain posts.
 Everyone (including guests) can read; only registered users can post.
-Three boards (General, Tech, Off-Topic) are created on first start; further
-boards can be added by inserting into the `boards` table for now.
+Three boards (General, Tech, Off-Topic) are created on first start; manage
+boards with the admin tool (below).
 
 - Board list / thread list: ↑/↓, Enter to open, Esc to go back
 - Thread list: `n` starts a new thread
@@ -69,6 +69,55 @@ characters removed) regardless of what the client sent. Whitespace is kept
 as typed, apart from trailing spaces, tabs (expanded to 4 spaces), runs of
 more than 3 blank lines and blank lines at the start or end of a post.
 
+## Who's online
+
+Main menu → **Who's online** lists the registered users currently connected,
+what each is doing (main menu, reading a thread, writing a post, ...) and
+for how long, with a `[sysop]` badge for sysops. Guests are only counted, not
+named. `r` refreshes the snapshot.
+
+## Sysops and administration
+
+Administration is split in two, on purpose:
+
+- **Inside the BBS** a sysop can moderate content in context: `x` in a
+  thread list deletes the selected thread (after confirmation), `x` in a
+  thread asks for a post number and deletes that post. Sysop posts carry a
+  `[sysop]` badge. Everything else stays out of the public SSH interface.
+- **`bbsadmin`** is a command-line tool for everything else, run on the
+  host with shell access. It works directly on the SQLite database using the
+  same code as the server, and can run while the server is up; changes apply
+  immediately.
+
+```
+cargo run --bin bbsadmin -- <command>        # or ./target/release/bbsadmin
+```
+
+It finds the database through `--data-dir` or `BBS_DATA_DIR` (default
+`data`), and refuses to run if there is no `bbs.db` there.
+
+| Command | What it does |
+|---|---|
+| `stats` | counts of users, boards, threads, posts, keys |
+| `board list` / `add NAME [-d TEXT]` / `rename ID NAME` / `describe ID TEXT` / `move ID POS` | manage boards |
+| `board delete ID [--force]` | delete a board; refuses if it has threads unless `--force` |
+| `user list` / `show NAME` | list users; show one with their SSH keys |
+| `user add NAME [--sysop]` | create an account (asks for a password without echo; `--password-stdin` for scripts) |
+| `user promote NAME` / `demote NAME` | grant or remove the sysop role |
+| `user ban NAME [-r REASON]` / `unban NAME` | suspend or restore an account |
+| `user passwd NAME` | set a new password (there is no self-service reset) |
+| `user remove-key KEY_ID` | remove an SSH key (ids are shown by `user show`) |
+| `thread list BOARD_ID` / `delete ID` | list or delete threads |
+| `post list THREAD_ID` / `delete ID` | list posts with ids, or delete one (the thread goes with its last post) |
+
+**Creating the first sysop:** either `bbsadmin user add sysop --sysop`, or
+register normally in the BBS and then `bbsadmin user promote yourname`.
+
+A **ban** blocks login (password and key) and posting immediately, and a
+connected user is disconnected within about 10 seconds. Roles are never
+trusted from the session: every moderation action and every post re-reads the
+account from the database, so a demotion or ban takes effect at once.
+
 ## Security notes
 
 - Passwords are hashed with Argon2id (random salt); nothing is stored in
@@ -80,9 +129,13 @@ more than 3 blank lines and blank lines at the start or end of a post.
   `src/state.rs` accordingly.
 - Only `password` and `publickey` authentication are offered. Exec,
   subsystem (sftp) and port-forwarding requests are refused.
+- Bans and roles are enforced from the database on every action, not from
+  the login session (see above). The admin tool is not reachable over the
+  network; protect the data directory (`bbs.db`, `host_key`) with normal
+  file permissions.
 - Not done yet: pre-auth connection timeout (an idle unauthenticated
   connection is only dropped after the 1h inactivity timeout, bounded by the
-  per-address connection limit), account recovery, password change.
+  per-address connection limit), self-service password change and recovery.
 
 ## Controls
 
@@ -92,13 +145,16 @@ more than 3 blank lines and blank lines at the start or end of a post.
 
 ## Layout
 
-- `src/main.rs` — configuration, host key, DB and server start-up
+- `src/lib.rs` — the library everything lives in; two binaries use it
+- `src/main.rs` — the SSH server: configuration, host key, DB and start-up
+- `src/bin/bbsadmin.rs` — the admin command-line tool
+- `tests/admin_cli.rs` — runs the real `bbsadmin` against a temporary database
 - `src/server.rs` — `russh` handler: authentication (password + public
   key), session/PTY setup, and executing the UI's `Request`s
 - `src/state.rs` — state shared by all connections (DB, rate limiter,
-  session `Identity`)
-- `src/db.rs` — SQLite schema and queries (`users`, `ssh_keys`, `boards`,
-  `threads`, `posts`)
+  who's-online registry, session `Identity`)
+- `src/db.rs` — SQLite schema, migrations and queries (`users`, `ssh_keys`,
+  `boards`, `threads`, `posts`), including everything the admin tool uses
 - `src/boards.rs` — board requests: permission checks, validation, rate
   limiting; calls into `db.rs`
 - `src/content.rs` — sanitising and limits for titles and post bodies
@@ -108,8 +164,9 @@ more than 3 blank lines and blank lines at the start or end of a post.
   machine; it is synchronous and asks the server to do async work by
   returning a `Request`, then receives a `Response`. `input.rs` parses raw
   bytes into keys and has the text-field widget; `register.rs` and
-  `keys.rs`, `boards.rs` (board list, thread list, thread view) and
-  `compose.rs` (multi-line editor and compose screen) are screens.
+  `keys.rs`, `boards.rs` (board list, thread list, thread view),
+  `compose.rs` (multi-line editor and compose screen) and `online.rs` are
+  screens.
 
 ### Adding a screen
 
@@ -120,8 +177,7 @@ more than 3 blank lines and blank lines at the start or end of a post.
 
 ## Next steps
 
-- Sysop role: create/delete boards, delete posts, ban users
 - Unread tracking and new-post indicators
 - Thread/post pagination beyond the current caps
-- Shared online-users registry for "Who's online" (and later live chat)
-- Password change, sysop/moderation tools
+- Live chat between online users
+- Self-service password change; private messages

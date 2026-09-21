@@ -155,6 +155,7 @@ pub struct BoardRecord {
     pub id: i64,
     pub name: String,
     pub description: String,
+    pub position: i64,
     pub thread_count: i64,
 }
 
@@ -199,6 +200,20 @@ pub enum DbError {
     NotEmpty,
     Other,
 }
+
+impl std::fmt::Display for DbError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            DbError::Duplicate => "already exists",
+            DbError::LimitReached => "limit reached",
+            DbError::NotFound => "not found",
+            DbError::NotEmpty => "not empty",
+            DbError::Other => "database error",
+        })
+    }
+}
+
+impl std::error::Error for DbError {}
 
 impl From<rusqlite::Error> for DbError {
     fn from(err: rusqlite::Error) -> Self {
@@ -395,7 +410,7 @@ impl Db {
     pub fn list_boards(&self) -> Result<Vec<BoardRecord>, DbError> {
         let conn = self.conn();
         let mut stmt = conn.prepare(
-            "SELECT b.id, b.name, b.description,
+            "SELECT b.id, b.name, b.description, b.position,
                     (SELECT COUNT(*) FROM threads t WHERE t.board_id = b.id)
              FROM boards b ORDER BY b.position, b.id",
         )?;
@@ -404,7 +419,8 @@ impl Db {
                 id: row.get(0)?,
                 name: row.get(1)?,
                 description: row.get(2)?,
-                thread_count: row.get(3)?,
+                position: row.get(3)?,
+                thread_count: row.get(4)?,
             })
         })?;
         Ok(rows.collect::<Result<_, _>>()?)

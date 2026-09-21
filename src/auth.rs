@@ -28,7 +28,9 @@ const RESERVED_NAMES: &[&str] = &[
     "staff",
 ];
 
-pub fn validate_username(name: &str) -> Result<(), String> {
+/// Syntax rules only. The admin tool uses this directly so a sysop can create
+/// accounts with otherwise reserved names such as "sysop".
+pub fn validate_username_format(name: &str) -> Result<(), String> {
     let len = name.chars().count();
     if !(USERNAME_MIN..=USERNAME_MAX).contains(&len) {
         return Err(format!(
@@ -44,6 +46,12 @@ pub fn validate_username(name: &str) -> Result<(), String> {
     {
         return Err("Username may only contain letters, digits, '_' and '-'.".into());
     }
+    Ok(())
+}
+
+/// Rules for self-registration: the syntax rules plus reserved names.
+pub fn validate_username(name: &str) -> Result<(), String> {
+    validate_username_format(name)?;
     if RESERVED_NAMES.iter().any(|r| r.eq_ignore_ascii_case(name)) {
         return Err("That username is reserved.".into());
     }
