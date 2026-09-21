@@ -31,6 +31,9 @@ const HIGHLIGHT: Style = Style::new()
     .bg(Color::Blue)
     .fg(Color::White)
     .add_modifier(Modifier::BOLD);
+const NEW: Style = Style::new()
+    .fg(Color::Green)
+    .add_modifier(Modifier::BOLD);
 const DIM: Style = Style::new().fg(Color::Gray);
 
 fn move_selection(selected: &mut usize, len: usize, key: Key) {
@@ -115,6 +118,14 @@ impl BoardList {
                             format!("{}  ({} threads)", b.description, b.thread_count),
                             DIM,
                         ),
+                        Span::styled(
+                            if b.unread_threads > 0 {
+                                format!("  {} unread", b.unread_threads)
+                            } else {
+                                String::new()
+                            },
+                            NEW,
+                        ),
                     ]))
                 })
                 .collect()
@@ -144,6 +155,7 @@ pub enum ThreadsEvent {
     DeleteThread { thread_id: i64 },
     Open { board_id: i64, thread_id: i64 },
     New { board_id: i64 },
+    MarkBoardRead { board_id: i64 },
 }
 
 pub struct ThreadList {
@@ -154,13 +166,16 @@ pub struct ThreadList {
     loaded: bool,
     /// Shows moderation keys. Purely cosmetic: the server decides.
     sysop: bool,
+    /// Logged-in user (guests have no read markers).
+    member: bool,
     confirm_delete: bool,
 }
 
 impl ThreadList {
-    pub fn loading(board_id: i64, sysop: bool) -> Self {
+    pub fn loading(board_id: i64, sysop: bool, member: bool) -> Self {
         Self {
             sysop,
+            member,
             confirm_delete: false,
             board_id,
             board_name: String::new(),
@@ -197,6 +212,11 @@ impl ThreadList {
                     board_id: self.board_id,
                 };
             }
+            Key::Char('m') if self.member => {
+                return ThreadsEvent::MarkBoardRead {
+                    board_id: self.board_id,
+                };
+            }
             Key::Enter => {
                 if let Some(thread) = self.threads.get(self.selected) {
                     return ThreadsEvent::Open {
@@ -221,11 +241,28 @@ impl ThreadList {
                 .iter()
                 .map(|t| {
                     let replies = t.post_count.saturating_sub(1);
+                    let unread = t.unread > 0;
                     ListItem::new(Line::from(vec![
-                        Span::raw(t.title.clone()),
+                        Span::styled(if unread { "* " } else { "  " }, NEW),
+                        Span::styled(
+                            t.title.clone(),
+                            if unread {
+                                Style::new().add_modifier(Modifier::BOLD)
+                            } else {
+                                Style::new()
+                            },
+                        ),
                         Span::styled(
                             format!("  by {} · {replies} replies · {}", t.author, t.last_post),
                             DIM,
+                        ),
+                        Span::styled(
+                            if unread {
+                                format!("  [{} new]", t.unread)
+                            } else {
+                                String::new()
+                            },
+                            NEW,
                         ),
                     ]))
                 })
@@ -256,18 +293,16 @@ impl ThreadList {
                 .style(Style::new().fg(Color::Yellow)),
                 help,
             );
-        } else if self.sysop {
-            draw_help(
-                frame,
-                help,
-                "Enter: read · n: new thread · x: delete thread (sysop) · Esc: back",
-            );
         } else {
-            draw_help(
-                frame,
-                help,
-                "Enter: read · n: new thread · ↑/↓: move · Esc: back",
-            );
+            let mut text = String::from("Enter: read · n: new thread");
+            if self.member {
+                text.push_str(" · m: mark all read");
+            }
+            if self.sysop {
+                text.push_str(" · x: delete thread (sysop)");
+            }
+            text.push_str(" · Esc: back");
+            draw_help(frame, help, &text);
         }
     }
 }
@@ -296,6 +331,9 @@ pub struct ThreadView {
     scroll: Counter,
     total_lines: Counter,
     page_height: Counter,
+    /// Post (1-based index) to scroll to on the next draw, 0 for none. Set
+    /// when opening a thread with unread posts.
+    jump: Counter,
 }
 
 impl ThreadView {
@@ -312,6 +350,7 @@ impl ThreadView {
             scroll: Counter::new(0),
             total_lines: Counter::new(0),
             page_height: Counter::new(10),
+            jump: Counter::new(0),
         }
     }
 
@@ -324,6 +363,8 @@ impl ThreadView {
         if to_end {
             // Clamped to the real maximum on the next draw.
             view.scroll.set(usize::MAX);
+        } else if let Some(first_unread) = view.posts.iter().position(|p| p.unread) {
+            view.jump.set(first_unread + 1);
         }
         view
     }
@@ -396,10 +437,12 @@ impl ThreadView {
         let inner = block.inner(body);
 
         let mut lines: Vec<Line> = Vec::new();
+        let mut post_starts: Vec<usize> = Vec::new();
         if !self.loaded {
             lines.push(Line::from("Loading…"));
         }
         for (i, post) in self.posts.iter().enumerate() {
+            post_starts.push(lines.len());
             lines.push(Line::from(vec![
                 Span::styled(
                     format!("#{} {}", i + 1, post.author),
@@ -412,6 +455,7 @@ impl ThreadView {
                     Style::default().fg(Color::Yellow),
                 ),
                 Span::styled(format!("  {}", post.created), DIM),
+                Span::styled(if post.unread { "  NEW" } else { "" }, NEW),
             ]));
             lines.extend(
                 wrap(&post.body, inner.width as usize)
@@ -424,6 +468,11 @@ impl ThreadView {
         self.total_lines.set(lines.len());
         self.page_height.set(inner.height as usize);
         let max = lines.len().saturating_sub(inner.height as usize);
+        // Opening a thread with unread posts starts at the first of them.
+        if let Some(&start) = self.jump.get().checked_sub(1).and_then(|i| post_starts.get(i)) {
+            self.scroll.set(start);
+        }
+        self.jump.set(0);
         let scroll = self.scroll.get().min(max);
         self.scroll.set(scroll);
 

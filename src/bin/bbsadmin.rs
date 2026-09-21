@@ -183,7 +183,7 @@ fn run(db: &Db, command: Command) -> anyhow::Result<()> {
             };
             println!("Board {board_id}: {name}");
             println!("{:>5}  {:<40}  {:<16}  {:>5}  {}", "ID", "TITLE", "AUTHOR", "POSTS", "LAST POST");
-            for t in db_err(db.list_threads(board_id), "threads")? {
+            for t in db_err(db.list_threads(board_id, None), "threads")? {
                 println!(
                     "{:>5}  {:<40}  {:<16}  {:>5}  {}",
                     t.id,
@@ -207,7 +207,7 @@ fn run(db: &Db, command: Command) -> anyhow::Result<()> {
             };
             println!("Thread {thread_id}: {} (board {})", head.title, head.board_name);
             println!("{:>5}  {:<16}  {:<16}  {}", "ID", "AUTHOR", "POSTED", "TEXT");
-            for p in db_err(db.list_posts(thread_id), "posts")? {
+            for p in db_err(db.list_posts(thread_id, None), "posts")? {
                 println!(
                     "{:>5}  {:<16}  {:<16}  {}",
                     p.id,
@@ -233,7 +233,7 @@ fn board(db: &Db, cmd: BoardCommand) -> anyhow::Result<()> {
     match cmd {
         BoardCommand::List => {
             println!("{:>4}  {:>3}  {:<16}  {:>7}  {}", "ID", "POS", "NAME", "THREADS", "DESCRIPTION");
-            for b in db_err(db.list_boards(), "boards")? {
+            for b in db_err(db.list_boards(None), "boards")? {
                 println!(
                     "{:>4}  {:>3}  {:<16}  {:>7}  {}",
                     b.id, b.position, b.name, b.thread_count, b.description

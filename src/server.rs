@@ -176,13 +176,17 @@ impl BbsHandler {
             Request::Register { username, password } => {
                 Response::Registered(self.register(username, password).await)
             }
-            Request::ListBoards => boards::list_boards(&self.shared).await,
+            Request::ListBoards => boards::list_boards(&self.shared, self.user_id()).await,
             Request::ListThreads { board_id } => {
-                boards::list_threads(&self.shared, board_id, None).await
+                boards::list_threads(&self.shared, board_id, None, self.user_id()).await
             }
             Request::OpenThread { thread_id } => {
-                boards::open_thread(&self.shared, thread_id, false, None).await
+                boards::open_thread(&self.shared, thread_id, false, None, self.user_id()).await
             }
+            Request::MarkBoardRead { board_id } => match &self.identity {
+                Some(identity) => boards::mark_board_read(&self.shared, identity, board_id).await,
+                None => Response::Error(INTERNAL_ERROR.into()),
+            },
             Request::WhoIsOnline => self.who_is_online(),
             Request::DeleteThread { thread_id } => match &self.identity {
                 Some(identity) => boards::delete_thread(&self.shared, identity, thread_id).await,
@@ -474,7 +478,13 @@ impl Handler for BbsHandler {
         self.output = Some(TerminalHandle::start(session.handle(), channel.id()).await);
         // The real size arrives with the client's pty request; start at zero.
         self.terminal = Some(self.new_terminal(Rect::default())?);
-        self.app = Some(App::new(identity));
+        let unread = match identity.user_id() {
+            Some(id) => boards::unread_total(&self.shared, id).await,
+            None => 0,
+        };
+        let mut app = App::new(identity);
+        app.set_unread_threads(unread);
+        self.app = Some(app);
         self.join_online(session.handle());
 
         reply.accept().await;

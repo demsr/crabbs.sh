@@ -10,8 +10,17 @@ use crate::ui::{BoardInfo, PostInfo, Response, ThreadDetail, ThreadInfo};
 
 const INTERNAL_ERROR: &str = "Internal error, please try again later.";
 
-pub async fn list_boards(shared: &Arc<Shared>) -> Response {
-    match shared.blocking(|s| s.db.list_boards()).await {
+/// Threads with unread posts across all boards, for the main menu.
+pub async fn unread_total(shared: &Arc<Shared>, user_id: i64) -> i64 {
+    shared
+        .blocking(move |s| s.db.unread_thread_total(user_id))
+        .await
+        .unwrap_or(0)
+}
+
+/// `viewer` is the logged-in user's id (guests have no read markers).
+pub async fn list_boards(shared: &Arc<Shared>, viewer: Option<i64>) -> Response {
+    match shared.blocking(move |s| s.db.list_boards(viewer)).await {
         Ok(boards) => Response::Boards(
             boards
                 .into_iter()
@@ -20,6 +29,7 @@ pub async fn list_boards(shared: &Arc<Shared>) -> Response {
                     name: b.name,
                     description: b.description,
                     thread_count: b.thread_count,
+                    unread_threads: b.unread_threads,
                 })
                 .collect(),
         ),
@@ -31,12 +41,13 @@ pub async fn list_threads(
     shared: &Arc<Shared>,
     board_id: i64,
     notice: Option<String>,
+    viewer: Option<i64>,
 ) -> Response {
     let result = shared
         .blocking(move |s| {
             let name = s.db.board_name(board_id)?;
             match name {
-                Some(name) => Ok(Some((name, s.db.list_threads(board_id)?))),
+                Some(name) => Ok(Some((name, s.db.list_threads(board_id, viewer)?))),
                 None => Ok(None),
             }
         })
@@ -54,6 +65,7 @@ pub async fn list_threads(
                     author: t.author,
                     post_count: t.post_count,
                     last_post: t.last_post,
+                    unread: t.unread,
                 })
                 .collect(),
         },
@@ -67,13 +79,20 @@ pub async fn open_thread(
     thread_id: i64,
     to_end: bool,
     notice: Option<String>,
+    viewer: Option<i64>,
 ) -> Response {
     let result = shared
         .blocking(move |s| {
             let Some(head) = s.db.thread_head(thread_id)? else {
                 return Ok(None);
             };
-            Ok(Some((head, s.db.list_posts(thread_id)?)))
+            // Read the posts (with their unread flags) first, then advance
+            // the read pointer: what was new stays flagged on this screen.
+            let posts = s.db.list_posts(thread_id, viewer)?;
+            if let Some(user_id) = viewer {
+                s.db.mark_thread_read(user_id, thread_id)?;
+            }
+            Ok(Some((head, posts)))
         })
         .await;
     match result {
@@ -92,6 +111,7 @@ pub async fn open_thread(
                         author_is_sysop: p.author_is_sysop,
                         body: p.body,
                         created: p.created,
+                        unread: p.unread,
                     })
                     .collect(),
             },
@@ -184,7 +204,9 @@ pub async fn create_thread(
         .blocking(move |s| s.db.create_thread(board_id, user_id, &title, &body))
         .await
     {
-        Ok(thread_id) => open_thread(shared, thread_id, true, Some("Posted.".into())).await,
+        Ok(thread_id) => {
+            open_thread(shared, thread_id, true, Some("Posted.".into()), Some(user_id)).await
+        }
         Err(err) => post_error(err, "board"),
     }
 }
@@ -209,7 +231,9 @@ pub async fn reply(
         .blocking(move |s| s.db.add_post(thread_id, user_id, &body))
         .await
     {
-        Ok(()) => open_thread(shared, thread_id, true, Some("Posted.".into())).await,
+        Ok(()) => {
+            open_thread(shared, thread_id, true, Some("Posted.".into()), Some(user_id)).await
+        }
         Err(err) => post_error(err, "thread"),
     }
 }
@@ -219,7 +243,15 @@ pub async fn delete_thread(shared: &Arc<Shared>, identity: &Identity, thread_id:
         return Response::Error(e);
     }
     match shared.blocking(move |s| s.db.delete_thread(thread_id)).await {
-        Ok(board_id) => list_threads(shared, board_id, Some("Thread deleted.".into())).await,
+        Ok(board_id) => {
+            list_threads(
+                shared,
+                board_id,
+                Some("Thread deleted.".into()),
+                identity.user_id(),
+            )
+            .await
+        }
         Err(DbError::NotFound) => Response::Error("That thread no longer exists.".into()),
         Err(_) => Response::Error(INTERNAL_ERROR.into()),
     }
@@ -235,11 +267,43 @@ pub async fn delete_post(shared: &Arc<Shared>, identity: &Identity, post_id: i64
                 shared,
                 d.board_id,
                 Some("Post deleted; the thread is gone too.".into()),
+                identity.user_id(),
             )
             .await
         }
-        Ok(d) => open_thread(shared, d.thread_id, false, Some("Post deleted.".into())).await,
+        Ok(d) => {
+            open_thread(
+                shared,
+                d.thread_id,
+                false,
+                Some("Post deleted.".into()),
+                identity.user_id(),
+            )
+            .await
+        }
         Err(DbError::NotFound) => Response::Error("That post no longer exists.".into()),
+        Err(_) => Response::Error(INTERNAL_ERROR.into()),
+    }
+}
+
+/// Marks every thread in the board as read, then shows the refreshed list.
+pub async fn mark_board_read(shared: &Arc<Shared>, identity: &Identity, board_id: i64) -> Response {
+    let Some(user_id) = identity.user_id() else {
+        return Response::Error("Guests don't have read markers. Register an account first.".into());
+    };
+    match shared
+        .blocking(move |s| s.db.mark_board_read(user_id, board_id))
+        .await
+    {
+        Ok(()) => {
+            list_threads(
+                shared,
+                board_id,
+                Some("Marked everything in this board as read.".into()),
+                Some(user_id),
+            )
+            .await
+        }
         Err(_) => Response::Error(INTERNAL_ERROR.into()),
     }
 }

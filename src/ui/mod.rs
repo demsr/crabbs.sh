@@ -37,6 +37,10 @@ pub enum Request {
     DeleteKey(i64),
     ListBoards,
     WhoIsOnline,
+    /// Members only: mark every thread in the board as read.
+    MarkBoardRead {
+        board_id: i64,
+    },
     ListThreads {
         board_id: i64,
     },
@@ -99,6 +103,8 @@ pub struct BoardInfo {
     pub name: String,
     pub description: String,
     pub thread_count: i64,
+    /// Threads with posts the viewer hasn't read.
+    pub unread_threads: i64,
 }
 
 pub struct ThreadInfo {
@@ -107,6 +113,8 @@ pub struct ThreadInfo {
     pub author: String,
     pub post_count: i64,
     pub last_post: String,
+    /// Posts in the thread the viewer hasn't read.
+    pub unread: i64,
 }
 
 pub struct OnlineInfo {
@@ -124,6 +132,7 @@ pub struct PostInfo {
     pub author_is_sysop: bool,
     pub body: String,
     pub created: String,
+    pub unread: bool,
 }
 
 pub struct ThreadDetail {
@@ -156,7 +165,10 @@ enum MenuItem {
 }
 
 impl MenuItem {
-    fn label(self) -> &'static str {
+    fn label(self, unread_threads: i64) -> String {
+        if self == MenuItem::Board && unread_threads > 0 {
+            return format!("Message boards ({unread_threads} unread)");
+        }
         match self {
             MenuItem::Board => "Message boards",
             MenuItem::Online => "Who's online",
@@ -165,6 +177,7 @@ impl MenuItem {
             MenuItem::About => "About this BBS",
             MenuItem::LogOff => "Log off",
         }
+        .to_string()
     }
 }
 
@@ -198,9 +211,15 @@ pub struct App {
     status: Option<Status>,
     parser: KeyParser,
     queue: VecDeque<Key>,
+    /// Threads with unread posts, shown on the main menu.
+    unread_threads: i64,
 }
 
 impl App {
+    pub fn set_unread_threads(&mut self, count: i64) {
+        self.unread_threads = count;
+    }
+
     pub fn new(identity: Identity) -> Self {
         Self {
             identity,
@@ -212,6 +231,7 @@ impl App {
             }),
             parser: KeyParser::default(),
             queue: VecDeque::new(),
+            unread_threads: 0,
         }
     }
 
@@ -284,6 +304,9 @@ impl App {
                 }
             }
             Response::Boards(boards) => {
+                // The board list is refreshed whenever you come back to it,
+                // so it doubles as the source for the main-menu count.
+                self.unread_threads = boards.iter().map(|b| b.unread_threads).sum();
                 if let Screen::Boards(list) = &mut self.screen {
                     list.set(boards);
                 }
@@ -296,7 +319,11 @@ impl App {
             } => {
                 // Replaces whatever is showing: this also answers a deleted
                 // post that took its whole thread with it.
-                let mut list = ThreadList::loading(board_id, self.identity.is_sysop());
+                let mut list = ThreadList::loading(
+                    board_id,
+                    self.identity.is_sysop(),
+                    self.identity.user_id().is_some(),
+                );
                 list.set(board_name, threads);
                 self.screen = Screen::Threads(list);
                 if let Some(text) = notice {
@@ -354,6 +381,7 @@ impl App {
     fn handle_key(&mut self, key: Key) -> Option<Action> {
         self.status = None;
         let sysop = self.identity.is_sysop();
+        let member = self.identity.user_id().is_some();
         match &mut self.screen {
             Screen::Menu => self.handle_menu_key(key),
             Screen::About => {
@@ -377,12 +405,15 @@ impl App {
                     None
                 }
                 BoardsEvent::Open(board_id) => {
-                    self.screen = Screen::Threads(ThreadList::loading(board_id, sysop));
+                    self.screen = Screen::Threads(ThreadList::loading(board_id, sysop, member));
                     Some(Action::Request(Request::ListThreads { board_id }))
                 }
             },
             Screen::Threads(list) => match list.handle(key) {
                 ThreadsEvent::None => None,
+                ThreadsEvent::MarkBoardRead { board_id } => {
+                    Some(Action::Request(Request::MarkBoardRead { board_id }))
+                }
                 ThreadsEvent::DeleteThread { thread_id } => {
                     Some(Action::Request(Request::DeleteThread { thread_id }))
                 }
@@ -405,7 +436,7 @@ impl App {
                     Some(Action::Request(Request::DeletePost { post_id }))
                 }
                 ThreadEvent::Back { board_id } => {
-                    self.screen = Screen::Threads(ThreadList::loading(board_id, sysop));
+                    self.screen = Screen::Threads(ThreadList::loading(board_id, sysop, member));
                     Some(Action::Request(Request::ListThreads { board_id }))
                 }
                 ThreadEvent::Reply { thread_id, title } => {
@@ -542,7 +573,7 @@ impl App {
             .menu_items()
             .iter()
             .enumerate()
-            .map(|(i, item)| ListItem::new(format!("[{}] {}", i + 1, item.label())))
+            .map(|(i, item)| ListItem::new(format!("[{}] {}", i + 1, item.label(self.unread_threads))))
             .collect();
 
         let list = List::new(items)

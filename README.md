@@ -53,7 +53,7 @@ Three boards (General, Tech, Off-Topic) are created on first start; manage
 boards with the admin tool (below).
 
 - Board list / thread list: ↑/↓, Enter to open, Esc to go back
-- Thread list: `n` starts a new thread
+- Thread list: `n` starts a new thread, `m` marks the whole board as read
 - Thread view: ↑/↓, PgUp/PgDn or Space to scroll, `r` to reply, Esc back
 - Editor: type normally (lines word-wrap at 78 columns), **Ctrl-D** posts,
   Esc cancels, Tab indents (4 spaces), Shift-Tab jumps back to the title,
@@ -68,6 +68,24 @@ All text is sanitised on the server (control characters and bidi/zero-width
 characters removed) regardless of what the client sent. Whitespace is kept
 as typed, apart from trailing spaces, tabs (expanded to 4 spaces), runs of
 more than 3 blank lines and blank lines at the start or end of a post.
+
+### Unread markers
+
+For registered users the BBS remembers how far each thread has been read:
+
+- the main menu shows `Message boards (N unread)`, the number of threads with
+  something new;
+- the board list shows `N unread` per board;
+- the thread list marks threads with unread posts with `*` and `[N new]`,
+  which also catches new replies in old threads, not just new topics;
+- opening a thread scrolls to the first unread post, tags unread posts `NEW`
+  and then marks the thread read.
+
+Your own posts are never unread for you, and history from before you
+registered counts as read. Guests have no markers. State lives in the
+`thread_reads` table (one pointer per user and thread) and is created
+automatically in existing databases; for existing users, everything posted
+since they registered shows as unread once.
 
 ## Who's online
 
@@ -154,7 +172,8 @@ account from the database, so a demotion or ban takes effect at once.
 - `src/state.rs` — state shared by all connections (DB, rate limiter,
   who's-online registry, session `Identity`)
 - `src/db.rs` — SQLite schema, migrations and queries (`users`, `ssh_keys`,
-  `boards`, `threads`, `posts`), including everything the admin tool uses
+  `boards`, `threads`, `posts`, `thread_reads`), including everything the
+  admin tool uses
 - `src/boards.rs` — board requests: permission checks, validation, rate
   limiting; calls into `db.rs`
 - `src/content.rs` — sanitising and limits for titles and post bodies
@@ -177,7 +196,6 @@ account from the database, so a demotion or ban takes effect at once.
 
 ## Next steps
 
-- Unread tracking and new-post indicators
 - Thread/post pagination beyond the current caps
 - Live chat between online users
 - Self-service password change; private messages

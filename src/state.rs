@@ -20,6 +20,14 @@ pub enum Identity {
 }
 
 impl Identity {
+    /// The account id, or `None` for guests.
+    pub fn user_id(&self) -> Option<i64> {
+        match self {
+            Identity::Guest => None,
+            Identity::User { id, .. } => Some(*id),
+        }
+    }
+
     /// For display only. Anything that grants power must re-check the
     /// database, since roles can be changed while a session is running.
     pub fn is_sysop(&self) -> bool {

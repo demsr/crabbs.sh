@@ -1,7 +1,7 @@
 use std::path::Path;
 use std::sync::{Mutex, MutexGuard};
 
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, named_params, params};
 
 pub const MAX_KEYS_PER_USER: usize = 10;
 
@@ -54,6 +54,15 @@ CREATE TABLE IF NOT EXISTS posts (
 );
 
 CREATE INDEX IF NOT EXISTS posts_thread ON posts(thread_id, id);
+
+-- How far each user has read each thread. A post is unread for a user if it
+-- is newer than this pointer (see UNREAD below).
+CREATE TABLE IF NOT EXISTS thread_reads (
+    user_id           INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    thread_id         INTEGER NOT NULL REFERENCES threads(id) ON DELETE CASCADE,
+    last_read_post_id INTEGER NOT NULL,
+    PRIMARY KEY (user_id, thread_id)
+);
 ";
 
 /// Created on first start, when there are no boards at all.
@@ -62,6 +71,21 @@ const DEFAULT_BOARDS: &[(&str, &str)] = &[
     ("Tech", "Programming, hardware, retro computing"),
     ("Off-Topic", "Everything else"),
 ];
+
+/// SQL condition, for a post aliased `p` and the viewer bound as `:uid`, that
+/// is true when the post is unread for that viewer: written by someone else,
+/// posted since the viewer registered (older history isn't "new" to them),
+/// and past their read pointer for the thread. Guests are bound as -1, which
+/// matches no user, so nothing is ever unread for them.
+const UNREAD: &str = "(p.author_id != :uid
+    AND p.created_at >= COALESCE((SELECT created_at FROM users WHERE id = :uid), 9223372036854775807)
+    AND p.id > COALESCE((SELECT r.last_read_post_id FROM thread_reads r
+                         WHERE r.user_id = :uid AND r.thread_id = p.thread_id), 0))";
+
+/// The value bound to `:uid` for a viewer; guests get an id no user has.
+fn viewer_id(viewer: Option<i64>) -> i64 {
+    viewer.unwrap_or(-1)
+}
 
 pub const MAX_THREADS_LISTED: usize = 100;
 pub const MAX_POSTS_PER_THREAD: usize = 200;
@@ -157,6 +181,8 @@ pub struct BoardRecord {
     pub description: String,
     pub position: i64,
     pub thread_count: i64,
+    /// Threads with at least one post the viewer hasn't read.
+    pub unread_threads: i64,
 }
 
 pub struct ThreadRecord {
@@ -166,6 +192,8 @@ pub struct ThreadRecord {
     pub post_count: i64,
     /// UTC, already formatted for display.
     pub last_post: String,
+    /// Posts in this thread the viewer hasn't read.
+    pub unread: i64,
 }
 
 pub struct ThreadHead {
@@ -181,6 +209,7 @@ pub struct PostRecord {
     pub author_is_sysop: bool,
     pub body: String,
     pub created: String,
+    pub unread: bool,
 }
 
 pub struct KeyRecord {
@@ -407,20 +436,23 @@ impl Db {
         Ok(())
     }
 
-    pub fn list_boards(&self) -> Result<Vec<BoardRecord>, DbError> {
+    pub fn list_boards(&self, viewer: Option<i64>) -> Result<Vec<BoardRecord>, DbError> {
         let conn = self.conn();
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare(&format!(
             "SELECT b.id, b.name, b.description, b.position,
-                    (SELECT COUNT(*) FROM threads t WHERE t.board_id = b.id)
-             FROM boards b ORDER BY b.position, b.id",
-        )?;
-        let rows = stmt.query_map([], |row| {
+                    (SELECT COUNT(*) FROM threads t WHERE t.board_id = b.id),
+                    (SELECT COUNT(*) FROM threads t WHERE t.board_id = b.id AND EXISTS
+                        (SELECT 1 FROM posts p WHERE p.thread_id = t.id AND {UNREAD}))
+             FROM boards b ORDER BY b.position, b.id"
+        ))?;
+        let rows = stmt.query_map(named_params! {":uid": viewer_id(viewer)}, |row| {
             Ok(BoardRecord {
                 id: row.get(0)?,
                 name: row.get(1)?,
                 description: row.get(2)?,
                 position: row.get(3)?,
                 thread_count: row.get(4)?,
+                unread_threads: row.get(5)?,
             })
         })?;
         Ok(rows.collect::<Result<_, _>>()?)
@@ -438,24 +470,37 @@ impl Db {
     }
 
     /// Most recently active threads first, at most `MAX_THREADS_LISTED`.
-    pub fn list_threads(&self, board_id: i64) -> Result<Vec<ThreadRecord>, DbError> {
+    pub fn list_threads(
+        &self,
+        board_id: i64,
+        viewer: Option<i64>,
+    ) -> Result<Vec<ThreadRecord>, DbError> {
         let conn = self.conn();
         let mut stmt = conn.prepare(&format!(
             "SELECT t.id, t.title, u.username, t.post_count,
-                    strftime('{TIME_FORMAT}', t.last_post_at, 'unixepoch')
+                    strftime('{TIME_FORMAT}', t.last_post_at, 'unixepoch'),
+                    (SELECT COUNT(*) FROM posts p WHERE p.thread_id = t.id AND {UNREAD})
              FROM threads t JOIN users u ON u.id = t.author_id
-             WHERE t.board_id = ?1
-             ORDER BY t.last_post_at DESC, t.id DESC LIMIT ?2"
+             WHERE t.board_id = :board
+             ORDER BY t.last_post_at DESC, t.id DESC LIMIT :limit"
         ))?;
-        let rows = stmt.query_map(params![board_id, MAX_THREADS_LISTED as i64], |row| {
-            Ok(ThreadRecord {
-                id: row.get(0)?,
-                title: row.get(1)?,
-                author: row.get(2)?,
-                post_count: row.get(3)?,
-                last_post: row.get(4)?,
-            })
-        })?;
+        let rows = stmt.query_map(
+            named_params! {
+                ":uid": viewer_id(viewer),
+                ":board": board_id,
+                ":limit": MAX_THREADS_LISTED as i64,
+            },
+            |row| {
+                Ok(ThreadRecord {
+                    id: row.get(0)?,
+                    title: row.get(1)?,
+                    author: row.get(2)?,
+                    post_count: row.get(3)?,
+                    last_post: row.get(4)?,
+                    unread: row.get(5)?,
+                })
+            },
+        )?;
         Ok(rows.collect::<Result<_, _>>()?)
     }
 
@@ -478,24 +523,75 @@ impl Db {
             .optional()?)
     }
 
-    pub fn list_posts(&self, thread_id: i64) -> Result<Vec<PostRecord>, DbError> {
+    pub fn list_posts(
+        &self,
+        thread_id: i64,
+        viewer: Option<i64>,
+    ) -> Result<Vec<PostRecord>, DbError> {
         let conn = self.conn();
         let mut stmt = conn.prepare(&format!(
             "SELECT p.id, u.username, u.role = 'sysop', p.body,
-                    strftime('{TIME_FORMAT}', p.created_at, 'unixepoch')
+                    strftime('{TIME_FORMAT}', p.created_at, 'unixepoch'),
+                    {UNREAD}
              FROM posts p JOIN users u ON u.id = p.author_id
-             WHERE p.thread_id = ?1 ORDER BY p.id LIMIT ?2"
+             WHERE p.thread_id = :thread ORDER BY p.id LIMIT :limit"
         ))?;
-        let rows = stmt.query_map(params![thread_id, MAX_POSTS_PER_THREAD as i64], |row| {
-            Ok(PostRecord {
-                id: row.get(0)?,
-                author: row.get(1)?,
-                author_is_sysop: row.get(2)?,
-                body: row.get(3)?,
-                created: row.get(4)?,
-            })
-        })?;
+        let rows = stmt.query_map(
+            named_params! {
+                ":uid": viewer_id(viewer),
+                ":thread": thread_id,
+                ":limit": MAX_POSTS_PER_THREAD as i64,
+            },
+            |row| {
+                Ok(PostRecord {
+                    id: row.get(0)?,
+                    author: row.get(1)?,
+                    author_is_sysop: row.get(2)?,
+                    body: row.get(3)?,
+                    created: row.get(4)?,
+                    unread: row.get(5)?,
+                })
+            },
+        )?;
         Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// Marks everything currently in the thread as read. The pointer only
+    /// ever moves forward, so a stale view can't make posts unread again.
+    pub fn mark_thread_read(&self, user_id: i64, thread_id: i64) -> Result<(), DbError> {
+        self.conn().execute(
+            "INSERT INTO thread_reads (user_id, thread_id, last_read_post_id)
+             SELECT :uid, thread_id, MAX(id) FROM posts WHERE thread_id = :thread GROUP BY thread_id
+             ON CONFLICT(user_id, thread_id) DO UPDATE
+                 SET last_read_post_id = MAX(last_read_post_id, excluded.last_read_post_id)",
+            named_params! {":uid": user_id, ":thread": thread_id},
+        )?;
+        Ok(())
+    }
+
+    pub fn mark_board_read(&self, user_id: i64, board_id: i64) -> Result<(), DbError> {
+        self.conn().execute(
+            "INSERT INTO thread_reads (user_id, thread_id, last_read_post_id)
+             SELECT :uid, p.thread_id, MAX(p.id)
+             FROM posts p JOIN threads t ON t.id = p.thread_id
+             WHERE t.board_id = :board GROUP BY p.thread_id
+             ON CONFLICT(user_id, thread_id) DO UPDATE
+                 SET last_read_post_id = MAX(last_read_post_id, excluded.last_read_post_id)",
+            named_params! {":uid": user_id, ":board": board_id},
+        )?;
+        Ok(())
+    }
+
+    /// Number of threads, over all boards, with something unread.
+    pub fn unread_thread_total(&self, user_id: i64) -> Result<i64, DbError> {
+        Ok(self.conn().query_row(
+            &format!(
+                "SELECT COUNT(*) FROM threads t WHERE EXISTS
+                     (SELECT 1 FROM posts p WHERE p.thread_id = t.id AND {UNREAD})"
+            ),
+            named_params! {":uid": user_id},
+            |r| r.get(0),
+        )?)
     }
 
     /// Creates a thread and its first post atomically; returns the thread id.
@@ -787,15 +883,15 @@ mod tests {
     #[test]
     fn delete_post_updates_or_removes_thread() {
         let (db, id) = db_with_user();
-        let board = db.list_boards().unwrap()[0].id;
+        let board = db.list_boards(None).unwrap()[0].id;
         let thread = db.create_thread(board, id, "Title", "first").unwrap();
         db.add_post(thread, id, "second").unwrap();
-        let posts = db.list_posts(thread).unwrap();
+        let posts = db.list_posts(thread, None).unwrap();
         assert_eq!(posts.len(), 2);
 
         let d = db.delete_post(posts[1].id).unwrap();
         assert!(!d.thread_deleted);
-        assert_eq!(db.list_threads(board).unwrap()[0].post_count, 1);
+        assert_eq!(db.list_threads(board, None).unwrap()[0].post_count, 1);
 
         let d = db.delete_post(posts[0].id).unwrap();
         assert!(d.thread_deleted);
@@ -812,6 +908,87 @@ mod tests {
         db.delete_board(board, true).unwrap();
         assert!(db.board_name(board).unwrap().is_none());
         assert_eq!(db.create_board("general", "dup").unwrap_err(), DbError::Duplicate);
+    }
+
+    /// Two users and a board: `alice` writes, `bob` reads.
+    fn alice_bob() -> (Db, i64, i64, i64) {
+        let db = Db::open_in_memory().unwrap();
+        let alice = db.create_user("alice", "h").unwrap();
+        let bob = db.create_user("bob", "h").unwrap();
+        let board = db.list_boards(None).unwrap()[0].id;
+        (db, alice, bob, board)
+    }
+
+    #[test]
+    fn unread_counts_and_marking_read() {
+        let (db, alice, bob, board) = alice_bob();
+        let t = db.create_thread(board, alice, "Hello", "first").unwrap();
+        db.add_post(t, alice, "second").unwrap();
+
+        // Bob sees both of Alice's posts as unread; Alice sees none of her own.
+        assert_eq!(db.list_threads(board, Some(bob)).unwrap()[0].unread, 2);
+        assert_eq!(db.list_threads(board, Some(alice)).unwrap()[0].unread, 0);
+        assert_eq!(db.list_boards(Some(bob)).unwrap()[0].unread_threads, 1);
+        assert_eq!(db.unread_thread_total(bob).unwrap(), 1);
+        let flags: Vec<bool> = db.list_posts(t, Some(bob)).unwrap().iter().map(|p| p.unread).collect();
+        assert_eq!(flags, [true, true]);
+
+        db.mark_thread_read(bob, t).unwrap();
+        assert_eq!(db.list_threads(board, Some(bob)).unwrap()[0].unread, 0);
+        assert_eq!(db.unread_thread_total(bob).unwrap(), 0);
+
+        // A later reply is unread again, and only that one.
+        db.add_post(t, alice, "third").unwrap();
+        let flags: Vec<bool> = db.list_posts(t, Some(bob)).unwrap().iter().map(|p| p.unread).collect();
+        assert_eq!(flags, [false, false, true]);
+
+        // Bob's own reply never counts as unread for him.
+        db.mark_thread_read(bob, t).unwrap();
+        db.add_post(t, bob, "mine").unwrap();
+        assert_eq!(db.list_threads(board, Some(bob)).unwrap()[0].unread, 0);
+        // ...but it is unread for Alice.
+        assert_eq!(db.list_threads(board, Some(alice)).unwrap()[0].unread, 1);
+    }
+
+    #[test]
+    fn guests_never_have_unread() {
+        let (db, alice, _bob, board) = alice_bob();
+        db.create_thread(board, alice, "Hello", "text").unwrap();
+        assert_eq!(db.list_threads(board, None).unwrap()[0].unread, 0);
+        assert_eq!(db.list_boards(None).unwrap()[0].unread_threads, 0);
+    }
+
+    #[test]
+    fn history_from_before_registration_counts_as_read() {
+        let (db, alice, _bob, board) = alice_bob();
+        let t = db.create_thread(board, alice, "Old", "old post").unwrap();
+        // Make the thread predate anyone who registers afterwards.
+        db.conn().execute("UPDATE posts SET created_at = created_at - 1000", []).unwrap();
+        let carol = db.create_user("carol", "h").unwrap();
+        assert_eq!(db.list_threads(board, Some(carol)).unwrap()[0].unread, 0);
+        // A post made after she registered is new to her.
+        db.add_post(t, alice, "fresh").unwrap();
+        assert_eq!(db.list_threads(board, Some(carol)).unwrap()[0].unread, 1);
+    }
+
+    #[test]
+    fn mark_board_read_is_per_board_and_survives_deletion() {
+        let (db, alice, bob, board) = alice_bob();
+        let other = db.create_board("Other", "x").unwrap();
+        let t1 = db.create_thread(board, alice, "One", "a").unwrap();
+        db.create_thread(board, alice, "Two", "b").unwrap();
+        db.create_thread(other, alice, "Elsewhere", "c").unwrap();
+        assert_eq!(db.unread_thread_total(bob).unwrap(), 3);
+
+        db.mark_board_read(bob, board).unwrap();
+        let boards = db.list_boards(Some(bob)).unwrap();
+        let unread = |id| boards.iter().find(|b| b.id == id).unwrap().unread_threads;
+        assert_eq!((unread(board), unread(other)), (0, 1));
+
+        // Deleting a thread (or its board) cleans up the read pointers.
+        db.delete_thread(t1).unwrap();
+        db.delete_board(board, true).unwrap();
+        assert_eq!(db.unread_thread_total(bob).unwrap(), 1);
     }
 
     #[test]

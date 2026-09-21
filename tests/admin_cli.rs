@@ -113,19 +113,19 @@ fn boards_and_content() {
     let uid = db.account_by_name("alice").unwrap().unwrap().id;
 
     f.ok(&["board", "add", "Retro", "--description", "Old machines"]);
-    let board = db.list_boards().unwrap().into_iter().find(|b| b.name == "Retro").unwrap();
+    let board = db.list_boards(None).unwrap().into_iter().find(|b| b.name == "Retro").unwrap();
     assert!(f.fails(&["board", "add", "retro"]).contains("already exists"));
     f.ok(&["board", "rename", &board.id.to_string(), "Retro Computing"]);
     assert_eq!(db.board_name(board.id).unwrap().unwrap(), "Retro Computing");
 
     let thread = db.create_thread(board.id, uid, "Amiga", "first").unwrap();
     db.add_post(thread, uid, "second").unwrap();
-    let posts = db.list_posts(thread).unwrap();
+    let posts = db.list_posts(thread, None).unwrap();
 
     // A board with threads is only deleted with --force.
     assert!(f.fails(&["board", "delete", &board.id.to_string()]).contains("--force"));
     f.ok(&["post", "delete", &posts[1].id.to_string()]);
-    assert_eq!(db.list_posts(thread).unwrap().len(), 1);
+    assert_eq!(db.list_posts(thread, None).unwrap().len(), 1);
     let out = f.ok(&["post", "delete", &posts[0].id.to_string()]);
     assert!(out.contains("thread") && out.contains("gone"));
     assert!(db.thread_head(thread).unwrap().is_none());
