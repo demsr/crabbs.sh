@@ -64,6 +64,13 @@ fn parse_escape(s: &[u8]) -> Escape {
                         (b'~', b"3") => Some(Key::Delete),
                         (b'~', b"5") => Some(Key::PageUp),
                         (b'~', b"6") => Some(Key::PageDown),
+                        // Enter with modifiers (Shift+Enter, ...) from terminals
+                        // with extended keyboard protocols: kitty's "CSI 13;2 u"
+                        // and xterm's modifyOtherKeys "CSI 27;2;13 ~".
+                        (b'u', p) if p == b"13" || p.starts_with(b"13;") => Some(Key::Enter),
+                        (b'~', p) if p.starts_with(b"27;") && p.ends_with(b";13") => {
+                            Some(Key::Enter)
+                        }
                         _ => None,
                     };
                     return Escape::Done(key, i + 1);
@@ -94,8 +101,18 @@ fn parse_escape(s: &[u8]) -> Escape {
                 3,
             ),
         },
-        // ESC followed by something else (Alt+key): report Esc, keep the rest.
-        Some(_) => Escape::Done(Some(Key::Esc), 1),
+        // Shift+Enter and Alt+Enter are commonly sent as ESC CR (or ESC LF).
+        // That is one Enter, not "Esc, then Enter" - which would, say, leave
+        // the chat and immediately re-enter it.
+        Some(b'\r') | Some(b'\n') => Escape::Done(Some(Key::Enter), 2),
+        // ESC ESC: two Esc presses (or Alt+Esc). Report one, look at the rest.
+        Some(0x1b) => Escape::Done(Some(Key::Esc), 1),
+        // ESC + a multi-byte character (Alt+é): drop the ESC, keep the character.
+        Some(&b) if b >= 0x80 => Escape::Done(None, 1),
+        // ESC + any other ASCII byte is Alt+key. Nothing here uses those, and
+        // reading it as "Esc, then key" would make e.g. Alt+q log you off. A
+        // real Esc press arrives alone, so it is still recognised (above).
+        Some(_) => Escape::Done(None, 2),
     }
 }
 
@@ -119,6 +136,9 @@ impl KeyParser {
                     Escape::Incomplete => break,
                     Escape::Done(key, len) => {
                         keys.extend(key);
+                        // If an ESC CR pair swallowed the CR, a following LF is
+                        // the second half of a CRLF, not another Enter.
+                        self.last_was_cr = len == 2 && buf[i + 1] == b'\r';
                         i += len;
                     }
                 },
@@ -294,6 +314,37 @@ mod tests {
         assert_eq!(p.feed(b"\x1bOA"), vec![Key::Up]);
         assert_eq!(p.feed(b"\x1b[3~"), vec![Key::Delete]);
         assert_eq!(p.feed(b"\x1b[5~\x1b[6~"), vec![Key::PageUp, Key::PageDown]);
+    }
+
+    #[test]
+    fn shift_and_alt_enter_are_a_plain_enter() {
+        let mut p = KeyParser::default();
+        // As many terminals send Shift+Enter / Alt+Enter:
+        assert_eq!(p.feed(b"\x1b\r"), vec![Key::Enter]);
+        assert_eq!(p.feed(b"\x1b\n"), vec![Key::Enter]);
+        assert_eq!(p.feed(b"\x1b\r\n"), vec![Key::Enter], "CRLF after ESC CR is still one Enter");
+        // With extended keyboard protocols (kitty / xterm modifyOtherKeys):
+        assert_eq!(p.feed(b"\x1b[13;2u"), vec![Key::Enter]);
+        assert_eq!(p.feed(b"\x1b[13u"), vec![Key::Enter]);
+        assert_eq!(p.feed(b"\x1b[27;2;13~"), vec![Key::Enter]);
+        // Other keys in those protocols stay ignored rather than misread.
+        assert_eq!(p.feed(b"\x1b[97;5u"), vec![]);
+        assert_eq!(p.feed(b"\x1b[27;5;97~"), vec![]);
+    }
+
+    #[test]
+    fn alt_keys_are_not_read_as_esc_plus_key() {
+        let mut p = KeyParser::default();
+        assert_eq!(p.feed(b"\x1bq"), vec![], "Alt+q must not act like Esc then q");
+        assert_eq!(p.feed(b"\x1bb"), vec![]);
+        assert_eq!(p.feed(b"\x1b\x7f"), vec![], "Alt+Backspace");
+        assert_eq!(p.feed("\u{1b}ä".as_bytes()), vec![Key::Char('ä')], "Alt+ä keeps the character");
+        // Real Esc presses are unaffected.
+        assert_eq!(p.feed(b"\x1b"), vec![Key::Esc]);
+        assert_eq!(p.feed(b"\x1b\x1b"), vec![Key::Esc, Key::Esc]);
+        // A key typed after a lone Esc, in a later read, is its own key.
+        assert_eq!(p.feed(b"\x1b"), vec![Key::Esc]);
+        assert_eq!(p.feed(b"q"), vec![Key::Char('q')]);
     }
 
     #[test]

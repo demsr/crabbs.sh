@@ -246,6 +246,9 @@ account from the database, so a demotion or ban takes effect at once.
 - Menu: ↑/↓ or `j`/`k`, Enter, or a number key; `q` logs off
 - Forms: Tab/Enter next field, Esc cancel
 - Ctrl-C logs off from anywhere
+- Shift+Enter (and Alt/Ctrl+Enter) count as a plain Enter, however your
+  terminal encodes them (ESC CR, kitty `CSI 13;2u`, xterm modifyOtherKeys).
+  Other Alt+key combinations are ignored. A lone Esc press is still Esc.
 
 ## Layout
 
