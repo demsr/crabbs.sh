@@ -277,6 +277,9 @@ impl BbsHandler {
                 None => Response::Error(INTERNAL_ERROR.into()),
             },
             Request::WhoIsOnline => self.who_is_online(),
+            Request::ChangePassword { current, new } => {
+                Response::PasswordChanged(self.change_password(current, new).await)
+            }
             Request::JoinChat => self.join_chat().await,
             Request::LeaveChat => {
                 self.shared.chat.leave(self.chat_id);
@@ -323,6 +326,85 @@ impl BbsHandler {
                 self.keys_response(Some(notice)).await
             }
         }
+    }
+
+    /// Changes the logged-in user's password. Requires the current one, so a
+    /// hijacked or unattended session can't take the account over, and signs
+    /// out the user's other sessions so anyone who had the old password (or
+    /// a session) is locked out.
+    async fn change_password(&mut self, current: String, new: String) -> Result<String, String> {
+        let Some(identity @ Identity::User { id, .. }) = &self.identity else {
+            return Err("Register an account first.".into());
+        };
+        let user_id = *id;
+        // Name and status come from the database (suspended accounts are refused).
+        let account = boards::live_account(&self.shared, identity).await?;
+
+        let subject = Subject::User(user_id);
+        if !self.shared.limiter.allowed(subject, Event::PasswordAttempt) {
+            return Err("Too many wrong attempts. Try again in a few minutes.".into());
+        }
+        auth::validate_password(&account.username, &new)?;
+        if new == current {
+            return Err("The new password must differ from the current one.".into());
+        }
+
+        let name = account.username.clone();
+        let record = self
+            .shared
+            .blocking(move |s| s.db.find_user(&name))
+            .await
+            .map_err(|_| INTERNAL_ERROR.to_string())?
+            .ok_or_else(|| INTERNAL_ERROR.to_string())?;
+
+        let _permit = self
+            .shared
+            .hash_slots
+            .acquire()
+            .await
+            .map_err(|_| INTERNAL_ERROR.to_string())?;
+        let stored = record.password_hash;
+        let correct = self
+            .shared
+            .blocking(move |_| auth::verify_password(&current, &stored))
+            .await;
+        if !correct {
+            self.shared.limiter.record(subject, Event::PasswordAttempt);
+            return Err("Current password is wrong.".into());
+        }
+
+        let hash = self
+            .shared
+            .blocking(move |_| auth::hash_password(&new))
+            .await
+            .map_err(|err| {
+                eprintln!("{err}");
+                INTERNAL_ERROR.to_string()
+            })?;
+        self.shared
+            .blocking(move |s| s.db.set_password_hash(user_id, &hash))
+            .await
+            .map_err(|_| INTERNAL_ERROR.to_string())?;
+
+        let keep = self.online.as_ref().map(|guard| guard.id());
+        let mut signed_out = 0;
+        for (session_id, handle) in self.shared.online.sessions_of(user_id) {
+            if Some(session_id) != keep {
+                let _ = handle
+                    .disconnect(
+                        Disconnect::ByApplication,
+                        "Your password was changed; please log in again.".into(),
+                        String::new(),
+                    )
+                    .await;
+                signed_out += 1;
+            }
+        }
+        Ok(match signed_out {
+            0 => "Password changed.".to_string(),
+            1 => "Password changed. Your other session was signed out.".to_string(),
+            n => format!("Password changed. Your {n} other sessions were signed out."),
+        })
     }
 
     async fn join_chat(&self) -> Response {

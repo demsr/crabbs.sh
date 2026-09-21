@@ -102,7 +102,8 @@ enum UserCommand {
     },
     /// Lift a suspension
     Unban { name: String },
-    /// Set a new password (there is no self-service password reset)
+    /// Set a new password, e.g. for a user who forgot theirs (users can
+    /// change their own from the BBS menu, but there is no self-service recovery)
     Passwd {
         name: String,
         #[command(flatten)]

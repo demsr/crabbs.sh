@@ -4,6 +4,7 @@ mod compose;
 mod input;
 mod keys;
 mod online;
+mod password;
 mod register;
 mod text;
 
@@ -22,6 +23,7 @@ use compose::{Compose, ComposeEvent};
 use input::{Key, KeyParser};
 use keys::{KeysEvent, KeysScreen};
 use online::{OnlineEvent, OnlineScreen};
+use password::{PasswordEvent, PasswordForm};
 use register::{FormEvent, RegisterForm};
 
 /// Cap on buffered, not-yet-processed keystrokes.
@@ -69,6 +71,12 @@ pub enum Request {
         thread_id: i64,
         body: String,
     },
+    /// Members only. Needs the current password; on success the user's other
+    /// sessions are signed out.
+    ChangePassword {
+        current: String,
+        new: String,
+    },
     /// Members only: enter the chat room. Answered with a snapshot.
     JoinChat,
     LeaveChat,
@@ -104,6 +112,8 @@ pub enum Response {
         users: Vec<OnlineInfo>,
         guests: usize,
     },
+    /// Outcome of a password change: a confirmation, or why it was refused.
+    PasswordChanged(Result<String, String>),
     ChatJoined(ChatSnapshot),
     /// A chat message was refused (rate limit, suspended, ...).
     ChatRejected(String),
@@ -178,6 +188,7 @@ enum MenuItem {
     Online,
     Register,
     Keys,
+    Password,
     About,
     LogOff,
 }
@@ -193,6 +204,7 @@ impl MenuItem {
             MenuItem::Online => "Who's online",
             MenuItem::Register => "Register an account",
             MenuItem::Keys => "SSH keys",
+            MenuItem::Password => "Change password",
             MenuItem::About => "About this BBS",
             MenuItem::LogOff => "Log off",
         }
@@ -211,6 +223,7 @@ enum Screen {
     Compose(Box<ComposeScreen>),
     Online(OnlineScreen),
     Chat(ChatScreen),
+    Password(PasswordForm),
 }
 
 /// The compose screen remembers what to return to if it's cancelled.
@@ -267,6 +280,7 @@ impl App {
             Screen::Compose(_) => "Writing a post",
             Screen::Online(_) => "Checking who's online",
             Screen::Chat(_) => "Chatting",
+            Screen::Password(_) => "Account settings",
         }
     }
 
@@ -291,18 +305,13 @@ impl App {
     }
 
     fn menu_items(&self) -> Vec<MenuItem> {
-        let account_item = match self.identity {
-            Identity::Guest => MenuItem::Register,
-            Identity::User { .. } => MenuItem::Keys,
-        };
-        vec![
-            MenuItem::Board,
-            MenuItem::Chat,
-            MenuItem::Online,
-            account_item,
-            MenuItem::About,
-            MenuItem::LogOff,
-        ]
+        let mut items = vec![MenuItem::Board, MenuItem::Chat, MenuItem::Online];
+        match self.identity {
+            Identity::Guest => items.push(MenuItem::Register),
+            Identity::User { .. } => items.extend([MenuItem::Keys, MenuItem::Password]),
+        }
+        items.extend([MenuItem::About, MenuItem::LogOff]);
+        items
     }
 
     /// Buffers raw bytes from the SSH channel. Call `pump` afterwards.
@@ -391,6 +400,15 @@ impl App {
             Response::Online { users, guests } => {
                 if let Screen::Online(screen) = &mut self.screen {
                     screen.set(users, guests);
+                }
+            }
+            Response::PasswordChanged(Ok(notice)) => {
+                self.screen = Screen::Menu;
+                self.set_status(notice, false);
+            }
+            Response::PasswordChanged(Err(message)) => {
+                if let Screen::Password(form) = &mut self.screen {
+                    form.fail(message);
                 }
             }
             Response::ChatJoined(snapshot) => {
@@ -508,6 +526,16 @@ impl App {
                 }
                 ComposeEvent::Submit(request) => Some(Action::Request(request)),
             },
+            Screen::Password(form) => match form.handle(key) {
+                PasswordEvent::None => None,
+                PasswordEvent::Cancel => {
+                    self.screen = Screen::Menu;
+                    None
+                }
+                PasswordEvent::Submit { current, new } => {
+                    Some(Action::Request(Request::ChangePassword { current, new }))
+                }
+            },
             Screen::Chat(chat) => match chat.handle(key) {
                 ChatAction::None => None,
                 ChatAction::Leave => {
@@ -594,6 +622,9 @@ impl App {
                 return Some(Action::Request(Request::WhoIsOnline));
             }
             MenuItem::Register => self.screen = Screen::Register(RegisterForm::new()),
+            MenuItem::Password => {
+                self.screen = Screen::Password(PasswordForm::new(self.identity.display_name()));
+            }
             MenuItem::Keys => {
                 self.screen = Screen::Keys(KeysScreen::new());
                 return Some(Action::Request(Request::ListKeys));
@@ -627,6 +658,7 @@ impl App {
             Screen::Compose(screen) => screen.compose.draw(frame, body),
             Screen::Online(screen) => screen.draw(frame, body),
             Screen::Chat(chat) => chat.draw(frame, body),
+            Screen::Password(form) => form.draw(frame, body),
         }
         self.draw_status(frame, chunks[2]);
     }

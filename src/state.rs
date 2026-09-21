@@ -80,6 +80,8 @@ pub enum Event {
     Post,
     NewThread,
     ChatMessage,
+    /// A wrong "current password" while changing the password.
+    PasswordAttempt,
 }
 
 impl Event {
@@ -90,6 +92,7 @@ impl Event {
             Event::Post => (10, Duration::from_secs(10 * 60)),
             Event::NewThread => (3, Duration::from_secs(60 * 60)),
             Event::ChatMessage => (8, Duration::from_secs(10)),
+            Event::PasswordAttempt => (5, Duration::from_secs(10 * 60)),
         }
     }
 }
@@ -259,6 +262,15 @@ impl Online {
         users
     }
 
+    /// The sessions of one user, by registry id, with a handle to end each.
+    pub fn sessions_of(&self, user_id: i64) -> Vec<(u64, Handle)> {
+        self.entries()
+            .iter()
+            .filter(|(_, e)| e.user_id == Some(user_id))
+            .map(|(id, e)| (*id, e.handle.clone()))
+            .collect()
+    }
+
     /// Sessions of logged-in users, with a handle to end each one.
     pub fn user_sessions(&self) -> Vec<(i64, Handle)> {
         self.entries()
@@ -275,6 +287,10 @@ pub struct OnlineGuard {
 }
 
 impl OnlineGuard {
+    pub fn id(&self) -> u64 {
+        self.id
+    }
+
     pub fn update(&self, f: impl FnOnce(&mut OnlineEntry)) {
         if let Some(entry) = self.online.entries().get_mut(&self.id) {
             f(entry);

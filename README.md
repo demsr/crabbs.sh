@@ -45,6 +45,18 @@ Back it up along with `data/bbs.db`.
 Usernames: 3-16 characters, letters/digits/`_`/`-`, starting with a letter,
 case-insensitive. Passwords: 8-128 characters.
 
+**Changing your password:** main menu → **Change password**. You must enter
+your current password, then the new one twice. The new password follows the
+same rules and must differ from the old one. On success your other sessions
+are signed out (so anyone holding the old password or a stale session is
+locked out); the session you changed it from stays. Wrong current-password
+attempts are limited to 5 per 10 minutes per user, so a hijacked session
+can't be used to guess it. Your SSH keys are not affected; remove keys you no
+longer trust in the **SSH keys** screen.
+
+**Forgotten password:** there is no self-service recovery (no email is
+stored). A sysop with shell access resets it with `bbsadmin user passwd`.
+
 ## Message boards
 
 Main menu → **Message boards**. Boards contain threads, threads contain posts.
@@ -150,7 +162,7 @@ It finds the database through `--data-dir` or `BBS_DATA_DIR` (default
 | `user add NAME [--sysop]` | create an account (asks for a password without echo; `--password-stdin` for scripts) |
 | `user promote NAME` / `demote NAME` | grant or remove the sysop role |
 | `user ban NAME [-r REASON]` / `unban NAME` | suspend or restore an account |
-| `user passwd NAME` | set a new password (there is no self-service reset) |
+| `user passwd NAME` | set a new password, e.g. for someone who forgot theirs (users can change their own from the menu) |
 | `user remove-key KEY_ID` | remove an SSH key (ids are shown by `user show`) |
 | `thread list BOARD_ID` / `delete ID` | list or delete threads |
 | `post list THREAD_ID` / `delete ID` | list posts with ids, or delete one (the thread goes with its last post) |
@@ -182,7 +194,8 @@ account from the database, so a demotion or ban takes effect at once.
   file permissions.
 - Not done yet: pre-auth connection timeout (an idle unauthenticated
   connection is only dropped after the 1h inactivity timeout, bounded by the
-  per-address connection limit), self-service password change and recovery.
+  per-address connection limit), and self-service recovery of a forgotten
+  password (an admin resets it; see above).
 
 ## Controls
 
@@ -215,8 +228,8 @@ account from the database, so a demotion or ban takes effect at once.
   returning a `Request`, then receives a `Response`. `input.rs` parses raw
   bytes into keys and has the text-field widget; `register.rs` and
   `keys.rs`, `boards.rs` (board list, thread list, thread view),
-  `compose.rs` (multi-line editor and compose screen), `online.rs` and
-  `chat.rs` (the chat screen) are screens.
+  `compose.rs` (multi-line editor and compose screen), `online.rs`,
+  `chat.rs` (the chat screen) and `password.rs` are screens.
 
 ### Adding a screen
 
@@ -232,4 +245,3 @@ account from the database, so a demotion or ban takes effect at once.
 
 - Thread/post pagination beyond the current caps
 - Chat rooms/channels, private messages between users
-- Self-service password change
