@@ -45,6 +45,8 @@ non-root user - no SQLite or OpenSSL packages needed at runtime, since
 SQLite is compiled in (`rusqlite`'s `bundled` feature) and russh's crypto
 backend doesn't link a system TLS library.
 
+Plain `docker`:
+
 ```
 docker build -t rust-bbs .
 docker run -d --name rust-bbs \
@@ -54,8 +56,21 @@ docker run -d --name rust-bbs \
   rust-bbs
 ```
 
-- The `/data` volume holds `bbs.db` and `host_key`; without `-v` it's
-  anonymous and gone once the container is removed. `BBS_DATA_DIR` is
+Or `docker-compose.yml` at the repo root, an example that does the same:
+
+```
+docker compose up -d --build
+```
+
+By default it leaves `BBS_GUEST_PASSWORD` unset (guest disabled, as below);
+uncomment the `environment:` lines in the file, or add a `.env` next to it
+with `BBS_GUEST_PASSWORD=changeme`, to enable it.
+
+Either way:
+
+- The `/data` volume holds `bbs.db` and `host_key`; without it (plain
+  `docker run` with no `-v`, or editing the compose file's `volumes:` list)
+  it's anonymous and gone once the container is removed. `BBS_DATA_DIR` is
   already set to `/data` in the image, so you only need to mount the volume.
 - `BBS_GUEST_PASSWORD` isn't set in the image, so guest login (and with it
   self-registration) is disabled until you pass one, same as running the
@@ -63,8 +78,9 @@ docker run -d --name rust-bbs \
 - `BBS_PORT` changes the port the process listens on *inside* the container;
   map it with `-p hostport:containerport` either way.
 - Run `bbsadmin` against the running container's database with
-  `docker exec -it rust-bbs bbsadmin <command>` (it's on the image's `PATH`
-  and already sees `BBS_DATA_DIR=/data`).
+  `docker exec -it rust-bbs bbsadmin <command>` (plain `docker`) or
+  `docker compose exec bbs bbsadmin <command>` (compose) - it's on the
+  image's `PATH` and already sees `BBS_DATA_DIR=/data`.
 - `HEALTHCHECK` confirms the SSH port accepts TCP connections; it isn't a
   full SSH handshake, just enough for `docker run --restart` or an
   orchestrator to notice a hung or crashed process.
@@ -293,8 +309,9 @@ account from the database, so a demotion or ban takes effect at once.
 - `src/main.rs` — the SSH server: configuration, host key, DB and start-up
 - `src/bin/bbsadmin.rs` — the admin command-line tool
 - `tests/admin_cli.rs` — runs the real `bbsadmin` against a temporary database
-- `Dockerfile` — the production image (see the Docker section above);
-  `.devcontainer/` has the separate, dev-only container definition
+- `Dockerfile` / `docker-compose.yml` — the production image (see the
+  Docker section above); `.devcontainer/` has the separate, dev-only
+  container definition
 - `src/server.rs` — `russh` handler: authentication (password + public
   key), session/PTY setup, and executing the UI's `Request`s
 - `src/state.rs` — state shared by all connections (DB, rate limiter,

@@ -1,0 +1,31 @@
+# Example compose file for running the production image (see Dockerfile).
+# This is NOT the devcontainer's compose file - that one is separate, under
+# .devcontainer/, and builds a dev environment rather than the server image.
+#
+# Usage:
+#   docker compose up -d --build   # build the image and start the server
+#   docker compose logs -f         # follow the server's log output
+#   docker compose exec bbs bbsadmin user add alice --sysop
+#   docker compose down            # stop it (add -v to also drop bbs-data)
+#
+# BBS_GUEST_PASSWORD is commented out below, matching the image's own
+# default: guest login, and with it self-registration, stays disabled until
+# a password is set. Uncomment it (or put it in a ".env" file next to this
+# one, as BBS_GUEST_PASSWORD=..., which compose reads automatically) rather
+# than editing it in here if you'd rather not commit it to version control.
+
+services:
+  bbs:
+    build: .
+    image: rust-bbs
+    restart: unless-stopped
+    ports:
+      - "2222:2222"
+    volumes:
+      - bbs-data:/data
+    # Uncomment to enable guest login and self-registration (see README):
+    # environment:
+    #   BBS_GUEST_PASSWORD: changeme
+
+volumes:
+  bbs-data:
