@@ -1,0 +1,9 @@
+target/
+data/
+.git/
+.gitignore
+.devcontainer/
+tests/
+*.md
+Dockerfile
+.dockerignore
