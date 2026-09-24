@@ -285,6 +285,10 @@ account from the database, so a demotion or ban takes effect at once.
   block list; every action re-checks the account in the database.
 - Only `password` and `publickey` authentication are offered. Exec,
   subsystem (sftp) and port-forwarding requests are refused.
+- Connections that drop before or during the SSH handshake (health checks,
+  port scanners, a client that just vanishes) aren't logged - they're
+  extremely common on any exposed port and not a sign of anything wrong.
+  Anything else - a real protocol error, for instance - still is.
 - Bans and roles are enforced from the database on every action, not from
   the login session (see above). The admin tool is not reachable over the
   network; protect the data directory (`bbs.db`, `host_key`) with normal

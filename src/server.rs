@@ -116,7 +116,33 @@ impl ServerTrait for BbsServer {
     }
 
     fn handle_session_error(&mut self, error: anyhow::Error) {
-        eprintln!("session error: {error:#}");
+        if !is_benign_disconnect(&error) {
+            eprintln!("session error: {error:#}");
+        }
+    }
+}
+
+/// True for the ordinary ways a connection ends abruptly before or during
+/// the SSH handshake: a health check, a port scanner, a client that just
+/// drops off. Not a sign of anything wrong with the server - on a port
+/// exposed to the internet this happens constantly - so logging every one
+/// would only be noise that buries errors actually worth seeing.
+fn is_benign_disconnect(error: &anyhow::Error) -> bool {
+    use std::io::ErrorKind;
+    match error.downcast_ref::<russh::Error>() {
+        // Peer went away before/during the version or key exchange.
+        Some(russh::Error::Disconnect) => true,
+        // The same, one layer down: an OS-level read/write failure because
+        // the peer reset, aborted or otherwise abandoned the connection.
+        Some(russh::Error::IO(io_err)) => matches!(
+            io_err.kind(),
+            ErrorKind::ConnectionReset
+                | ErrorKind::ConnectionAborted
+                | ErrorKind::BrokenPipe
+                | ErrorKind::UnexpectedEof
+                | ErrorKind::TimedOut
+        ),
+        _ => false,
     }
 }
 
