@@ -20,13 +20,16 @@ ssh -p 2222 guest@localhost
 
 | Variable             | Default   | Meaning                                        |
 |----------------------|-----------|------------------------------------------------|
-| `BBS_PORT`           | `2222`    | TCP port to listen on                          |
-| `BBS_DATA_DIR`       | `data`    | Holds `bbs.db` (SQLite) and `host_key`         |
-| `BBS_GUEST_PASSWORD` | `letmein` | Password of the public `guest` account         |
+| `BBS_PORT`           | `2222`     | TCP port to listen on                         |
+| `BBS_DATA_DIR`       | `data`     | Holds `bbs.db` (SQLite) and `host_key`        |
+| `BBS_GUEST_PASSWORD` | *(unset)*  | Password of the public `guest` account        |
 
-**Change `BBS_GUEST_PASSWORD` before exposing the server publicly** if you
-don't want everyone who reads this README to get in. The guest account only
-exists so people can reach the registration screen.
+**The guest account is disabled unless `BBS_GUEST_PASSWORD` is set** - there
+is no default password to leave in place or forget about. Guest is also the
+only way to reach the registration screen, so with it disabled, new accounts
+can only be created by an admin, with `bbsadmin user add` (see below); the
+BBS itself has no other sign-up path. Set `BBS_GUEST_PASSWORD` to enable
+guest access and self-registration.
 
 The host key is generated on first start and stored in `data/host_key`
 (mode 0600), so clients don't get host-key-changed warnings after a restart.

@@ -700,7 +700,11 @@ impl Handler for BbsHandler {
         }
 
         let identity = if user.eq_ignore_ascii_case(GUEST_USER) {
-            (password == self.shared.guest_password).then_some(Identity::Guest)
+            self.shared
+                .guest_password
+                .as_deref()
+                .is_some_and(|expected| expected == password)
+                .then_some(Identity::Guest)
         } else {
             self.verify_password_login(user, password).await
         };

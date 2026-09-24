@@ -39,7 +39,10 @@ async fn main() -> anyhow::Result<()> {
 
     let host_key = load_or_create_host_key(&data_dir.join("host_key"))?;
     let db = Db::open(&data_dir.join("bbs.db")).context("opening database")?;
-    let guest_password = std::env::var("BBS_GUEST_PASSWORD").unwrap_or_else(|_| "letmein".into());
+    // No fallback password: if it isn't set, the guest account (and with it
+    // self-registration, only reachable from a guest session) stays disabled.
+    let guest_password = std::env::var("BBS_GUEST_PASSWORD").ok();
+    let guest_enabled = guest_password.is_some();
     let dummy_hash = auth::hash_password("not-a-real-password").map_err(anyhow::Error::msg)?;
 
     let shared = Arc::new(Shared {
@@ -72,8 +75,18 @@ async fn main() -> anyhow::Result<()> {
     let addr = ("0.0.0.0", port);
     println!("rust-bbs listening on {}:{}", addr.0, addr.1);
     println!("data directory: {}", data_dir.display());
-    println!("guest login: username 'guest' (password from BBS_GUEST_PASSWORD, default 'letmein')");
-    println!("connect with: ssh -p {port} guest@localhost");
+    match guest_enabled {
+        true => {
+            println!("guest login: username 'guest' (password from BBS_GUEST_PASSWORD)");
+            println!("connect with: ssh -p {port} guest@localhost");
+        }
+        false => {
+            println!(
+                "guest account disabled (BBS_GUEST_PASSWORD not set) - self-registration is \
+                 unreachable; create accounts with `bbsadmin user add`"
+            );
+        }
+    }
 
     tokio::spawn(rust_bbs::server::sweep_banned(Arc::clone(&shared)));
     let mut server = BbsServer::new(shared);

@@ -46,7 +46,9 @@ impl Identity {
 /// State shared by every connection.
 pub struct Shared {
     pub db: Db,
-    pub guest_password: String,
+    /// `None` disables the guest account (and, with it, self-registration,
+    /// which is only reachable from the guest session).
+    pub guest_password: Option<String>,
     /// Bounds concurrent Argon2 runs (each uses ~19 MiB and a CPU core), so a
     /// flood of login attempts can't exhaust memory.
     pub hash_slots: Semaphore,
