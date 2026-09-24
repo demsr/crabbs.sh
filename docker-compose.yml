@@ -18,6 +18,7 @@ services:
   bbs:
     build: .
     image: rust-bbs
+    container_name: rust-bbs
     restart: unless-stopped
     ports:
       - "2222:2222"
