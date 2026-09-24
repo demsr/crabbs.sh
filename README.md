@@ -306,6 +306,10 @@ account from the database, so a demotion or ban takes effect at once.
 - Shift+Enter (and Alt/Ctrl+Enter) count as a plain Enter, however your
   terminal encodes them (ESC CR, kitty `CSI 13;2u`, xterm modifyOtherKeys).
   Other Alt+key combinations are ignored. A lone Esc press is still Esc.
+- The session runs in your terminal's alternate screen buffer (like `vim`
+  or `less`), so logging off restores whatever was on screen before you
+  connected instead of leaving the BBS's colors and borders in your
+  scrollback.
 
 ## Layout
 

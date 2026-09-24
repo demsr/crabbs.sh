@@ -76,6 +76,18 @@ const MAX_TERMINAL_DIM: u32 = 500;
 
 const INTERNAL_ERROR: &str = "Internal error, please try again later.";
 
+/// This app draws into the client's normal screen buffer, not ratatui's
+/// alternate screen, so the client's terminal has to be switched to one
+/// explicitly. Otherwise everything drawn (borders, highlighted menu rows,
+/// colored tags) stays sitting in the client's own scrollback after
+/// disconnecting, looking like the session "kept its color theme".
+const ENTER_ALT_SCREEN: &[u8] = b"\x1b[?1049h";
+/// Leaves the alternate screen (restoring whatever was on the client's
+/// terminal before connecting) and shows the cursor again - ratatui hides it
+/// on any screen with no focused text field (most of the menu-driven ones),
+/// and it would otherwise stay hidden after disconnecting.
+const LEAVE_ALT_SCREEN: &[u8] = b"\x1b[?25h\x1b[?1049l";
+
 /// Factory for per-connection handlers; holds the state they all share.
 pub struct BbsServer {
     shared: Arc<Shared>,
@@ -785,7 +797,16 @@ impl Handler for BbsHandler {
             return Ok(());
         }
 
-        self.output = Some(TerminalHandle::start(session.handle(), channel.id()).await);
+        let mut output = TerminalHandle::start(session.handle(), channel.id()).await;
+        {
+            // Scoped: `CrosstermBackend` (used elsewhere in this file) also
+            // implements `Backend::flush`, which a file-wide import of this
+            // trait would collide with.
+            use std::io::Write as _;
+            let _ = output.write_all(ENTER_ALT_SCREEN);
+            let _ = output.flush();
+        }
+        self.output = Some(output);
         // The real size arrives with the client's pty request; start at zero.
         let terminal = self.new_terminal(Rect::default())?;
         lock_ui(&self.ui).terminal = Some(terminal);
@@ -895,6 +916,13 @@ impl Handler for BbsHandler {
             };
             match action {
                 Action::Quit => {
+                    // Written directly through `Session` (the same,
+                    // synchronous path `close` uses below), not through the
+                    // buffered `TerminalHandle` sink normal drawing goes
+                    // through - that's asynchronous, so there's no guarantee
+                    // it would reach the client before the close that
+                    // follows it.
+                    session.data(channel, LEAVE_ALT_SCREEN)?;
                     session.close(channel)?;
                     return Ok(());
                 }
