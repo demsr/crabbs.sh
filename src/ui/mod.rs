@@ -1095,12 +1095,19 @@ impl App {
         // An explicit, solid background (unlike the rest of the UI, which
         // never sets one) so the popup reads as a panel raised over the
         // menu instead of blending into the same terminal background.
-        let panel = Style::default().bg(Color::Black);
+        // Explicit fg on top of the explicit bg: relying on the terminal's
+        // default text color here would risk unreadable low-contrast text
+        // (e.g. a light default fg with a light terminal theme) now that
+        // the background is forced rather than inherited. `.style()` covers
+        // the interior, but border glyphs and the title text each have
+        // their own separate style in ratatui's Block and don't inherit it.
+        let panel = Style::default().bg(Color::Black).fg(Color::White);
         frame.render_widget(Clear, area);
         let block = Block::default()
             .title(" Message of the day ")
             .style(panel)
-            .border_style(panel.fg(Color::Cyan))
+            .border_style(panel)
+            .title_style(panel)
             .borders(Borders::ALL);
         let inner = block.inner(area);
         frame.render_widget(block, area);
