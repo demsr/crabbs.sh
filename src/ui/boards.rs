@@ -785,8 +785,25 @@ impl ThreadView {
                     quote: None,
                 };
             }
-            Key::Up | Key::Char('k') => self.scroll_by(-1),
-            Key::Down | Key::Char('j') | Key::Enter => self.scroll_by(1),
+            // When the whole thread already fits in the view there's
+            // nothing to scroll (max_scroll() is 0, scroll_by is a no-op),
+            // so the marked post would otherwise be stuck on the first one
+            // forever - move it directly by one post instead.
+            Key::Up | Key::Char('k') => {
+                if self.max_scroll() == 0 {
+                    self.quote_index.set(self.quote_index.get().saturating_sub(1));
+                } else {
+                    self.scroll_by(-1);
+                }
+            }
+            Key::Down | Key::Char('j') | Key::Enter => {
+                if self.max_scroll() == 0 {
+                    let last = self.posts.len().saturating_sub(1);
+                    self.quote_index.set((self.quote_index.get() + 1).min(last));
+                } else {
+                    self.scroll_by(1);
+                }
+            }
             // Reading on past the end of a page continues on the next one.
             Key::PageDown | Key::Char(' ') => {
                 if self.at_bottom() && self.page + 1 < self.pages {
@@ -812,12 +829,14 @@ impl ThreadView {
                     return self.goto(PageTarget::Page(0));
                 }
                 self.scroll.set(0);
+                self.quote_index.set(0); // takes effect when nothing scrolls; harmless otherwise
             }
             Key::End | Key::Char('G') => {
                 if self.page + 1 < self.pages {
                     return self.goto(PageTarget::Last);
                 }
                 self.scroll.set(usize::MAX);
+                self.quote_index.set(self.posts.len().saturating_sub(1));
             }
             _ => {}
         }
@@ -878,11 +897,18 @@ impl ThreadView {
 
         // Whichever post is at (or just above) that scroll position is the
         // one 'r' will quote; mark every one of its lines with "> " so it's
-        // obvious which one that is, live as you scroll.
-        let quote_index = post_starts.iter().rposition(|&start| start <= scroll);
-        if let Some(i) = quote_index {
-            self.quote_index.set(i);
+        // obvious which one that is, live as you scroll. But when the whole
+        // thread already fits in the view (max == 0), scrolling can't move
+        // at all, so there's nothing for this to derive from - in that case
+        // Up/Down/g/G in handle() move quote_index directly instead, and
+        // this leaves it alone rather than pinning it to post 0 forever.
+        if max > 0 {
+            if let Some(i) = post_starts.iter().rposition(|&start| start <= scroll) {
+                self.quote_index.set(i);
+            }
         }
+        self.quote_index
+            .set(self.quote_index.get().min(self.posts.len().saturating_sub(1)));
 
         // Second pass: the actual styled lines, now that we know which post
         // (if any) gets marked.
@@ -891,7 +917,7 @@ impl ThreadView {
             lines.push(Line::from("Loading…"));
         }
         for (i, (post, body_lines)) in self.posts.iter().zip(&wrapped).enumerate() {
-            let marked = quote_index == Some(i);
+            let marked = self.quote_index.get() == i;
             let mark = |mut spans: Vec<Span<'static>>| -> Line<'static> {
                 if marked {
                     let mut prefixed = vec![Span::styled("> ", Style::default().fg(Color::Cyan))];
@@ -1025,7 +1051,7 @@ mod tests {
                 unread: false,
             })
             .collect();
-        let mut v = ThreadView::from_detail(
+        let v = ThreadView::from_detail(
             ThreadDetail {
                 id: 9,
                 board_id: 1,
@@ -1084,6 +1110,38 @@ mod tests {
         let mut v = rendered(3, 6, 3);
         let event = v.handle(Key::Char('R'));
         assert!(matches!(event, ThreadEvent::Reply { quote: None, .. }));
+    }
+
+    #[test]
+    fn up_down_move_the_marker_directly_when_the_whole_thread_already_fits() {
+        // 3 short posts in a tall viewport: nothing needs to scroll, so
+        // scroll_by (which Up/Down normally drive quote_index through) is a
+        // permanent no-op here - Up/Down must move quote_index by hand
+        // instead, or the mark would be stuck on post 0 forever no matter
+        // how many times you press Down.
+        let mut v = rendered(3, 20, 0);
+        assert_eq!(v.max_scroll(), 0, "the whole thread fits: nothing to scroll");
+        assert_eq!(v.quote_index.get(), 0);
+
+        assert!(matches!(v.handle(Key::Down), ThreadEvent::None));
+        assert_eq!(v.quote_index.get(), 1, "Down moves the mark to the next post");
+
+        assert!(matches!(v.handle(Key::Down), ThreadEvent::None));
+        assert_eq!(v.quote_index.get(), 2);
+
+        // Can't move past the last post.
+        assert!(matches!(v.handle(Key::Down), ThreadEvent::None));
+        assert_eq!(v.quote_index.get(), 2);
+
+        assert!(matches!(v.handle(Key::Up), ThreadEvent::None));
+        assert_eq!(v.quote_index.get(), 1, "Up moves it back");
+
+        // 'g'/'G' jump straight to the first/last post too, not just the
+        // scroll-driven case.
+        assert!(matches!(v.handle(Key::Char('G')), ThreadEvent::None));
+        assert_eq!(v.quote_index.get(), 2);
+        assert!(matches!(v.handle(Key::Char('g')), ThreadEvent::None));
+        assert_eq!(v.quote_index.get(), 0);
     }
 
     #[test]
