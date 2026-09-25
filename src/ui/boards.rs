@@ -642,10 +642,23 @@ pub struct ThreadView {
     /// when opening a thread with unread posts.
     jump: Counter,
     /// Index into `posts` of whichever post is at (or just above) the top
-    /// of the current view - the one 'r' quotes. Recomputed on every draw
-    /// from the scroll position, so it tracks reading without needing a
-    /// separate selection gesture.
+    /// of the current view - the one 'r' quotes. Usually recomputed every
+    /// draw from the scroll position, so it tracks reading without needing
+    /// a separate selection gesture - except it can run ahead of what the
+    /// scroll position alone implies (see `derived_index`), for whichever
+    /// trailing posts are visible once scroll bottoms out but can never
+    /// themselves reach the top of the view.
     quote_index: Counter,
+    /// What `quote_index` would be from the scroll position alone, with no
+    /// manual adjustment - i.e. the last post whose start line is within
+    /// reach of scrolling. Once scroll is maxed out, one or more posts
+    /// after this one can still be fully visible (the last page's worth of
+    /// lines just doesn't happen to start exactly on a post boundary) but
+    /// can never become "top of view" by scrolling alone, since there's
+    /// nowhere further to scroll. Up/Down move `quote_index` past this by
+    /// hand in that case; recomputed every draw so handle() always compares
+    /// against the current one.
+    derived_index: Counter,
 }
 
 impl ThreadView {
@@ -668,6 +681,7 @@ impl ThreadView {
             page_height: Counter::new(10),
             jump: Counter::new(0),
             quote_index: Counter::new(0),
+            derived_index: Counter::new(0),
         }
     }
 
@@ -786,23 +800,31 @@ impl ThreadView {
                     quote: None,
                 };
             }
-            // When the whole thread already fits in the view there's
-            // nothing to scroll (max_scroll() is 0, scroll_by is a no-op),
-            // so the marked post would otherwise be stuck on the first one
-            // forever - move it directly by one post instead.
-            Key::Up | Key::Char('k') => {
-                if self.max_scroll() == 0 {
-                    self.quote_index.set(self.quote_index.get().saturating_sub(1));
-                } else {
-                    self.scroll_by(-1);
-                }
-            }
+            // Down: once scroll can't go any further (either the whole
+            // thread already fits with nothing to scroll, or it's genuinely
+            // scrolled to the bottom), move the mark itself instead of
+            // calling scroll_by, which would otherwise be a no-op forever -
+            // this is what reaches trailing posts that are visible on the
+            // last screenful but can never themselves reach the top of the
+            // view (see `derived_index`).
             Key::Down | Key::Char('j') | Key::Enter => {
-                if self.max_scroll() == 0 {
+                if self.at_bottom() {
                     let last = self.posts.len().saturating_sub(1);
                     self.quote_index.set((self.quote_index.get() + 1).min(last));
                 } else {
                     self.scroll_by(1);
+                }
+            }
+            // Up: the mirror image - while quote_index is still ahead of
+            // what scroll alone implies (we're unwinding a Down excursion
+            // past the scroll ceiling), step back through it by hand one
+            // post at a time; once it catches back up to derived_index,
+            // resume real scrolling.
+            Key::Up | Key::Char('k') => {
+                if self.quote_index.get() > self.derived_index.get() {
+                    self.quote_index.set(self.quote_index.get().saturating_sub(1));
+                } else {
+                    self.scroll_by(-1);
                 }
             }
             // Reading on past the end of a page continues on the next one.
@@ -897,14 +919,19 @@ impl ThreadView {
 
         // Whichever post is at (or just above) that scroll position is the
         // one 'r' will quote; mark every one of its lines with "> " so it's
-        // obvious which one that is, live as you scroll. But when the whole
-        // thread already fits in the view (max == 0), scrolling can't move
-        // at all, so there's nothing for this to derive from - in that case
-        // Up/Down/g/G in handle() move quote_index directly instead, and
-        // this leaves it alone rather than pinning it to post 0 forever.
-        if max > 0 {
-            if let Some(i) = post_starts.iter().rposition(|&start| start <= scroll) {
-                self.quote_index.set(i);
+        // obvious which one that is, live as you scroll. `quote_index` only
+        // follows this derived value when it wasn't already running ahead
+        // of it (i.e. not in the middle of a Down-past-the-ceiling
+        // excursion started in handle()) - otherwise leave it where
+        // handle() put it. It resumes following as soon as it's unwound
+        // back down to equal the derived value again (or scroll ever
+        // catches up past it, though in practice only 'G' sets it further
+        // ahead than that, and 'G' sets scroll to match).
+        let was_ahead = self.quote_index.get() > self.derived_index.get();
+        if let Some(derived) = post_starts.iter().rposition(|&start| start <= scroll) {
+            self.derived_index.set(derived);
+            if !was_ahead || derived >= self.quote_index.get() {
+                self.quote_index.set(derived);
             }
         }
         self.quote_index
@@ -1142,6 +1169,96 @@ mod tests {
         assert_eq!(v.quote_index.get(), 2);
         assert!(matches!(v.handle(Key::Char('g')), ThreadEvent::None));
         assert_eq!(v.quote_index.get(), 0);
+    }
+
+    #[test]
+    fn down_reaches_trailing_posts_that_scroll_alone_cant_bring_to_the_top() {
+        // 5 posts of 3 lines each (header + body + spacer) = 15 lines. A
+        // 4-line viewport gives max_scroll = 15 - 4 = 11, which falls
+        // strictly between post 3's start line (9) and post 4's (12) - so
+        // once scroll is maxed out at 11, post 4 is fully visible (the
+        // last 4 lines are exactly post 4's own 3 lines plus post 3's
+        // trailing spacer) but can never itself become "top of view" by
+        // scrolling, since scroll can't go past 11.
+        let posts = (0..5)
+            .map(|i| PostInfo {
+                id: 100 + i as i64,
+                author: format!("author{i}"),
+                author_is_sysop: false,
+                body: format!("post{i}"),
+                created: String::new(),
+                unread: false,
+            })
+            .collect();
+        let mut v = ThreadView::from_detail(
+            ThreadDetail {
+                id: 9,
+                board_id: 1,
+                board_name: "General".into(),
+                title: "T".into(),
+                posts,
+                page: 0,
+                pages: 1,
+                total: 5,
+            },
+            false,
+            false,
+            0,
+        );
+        let backend = ratatui::backend::TestBackend::new(40, 7); // inner height 4
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        let redraw = |v: &ThreadView, terminal: &mut ratatui::Terminal<_>| {
+            terminal
+                .draw(|f| {
+                    let area = f.area();
+                    v.draw(f, area);
+                })
+                .unwrap();
+        };
+        redraw(&v, &mut terminal);
+        assert_eq!(v.quote_index.get(), 0);
+
+        // Scroll down one line at a time until scroll itself can't move
+        // any further - a real app draws after every keypress, so redraw
+        // after each one, same as it would live.
+        let mut guard = 0;
+        while !v.at_bottom() {
+            v.handle(Key::Down);
+            redraw(&v, &mut terminal);
+            guard += 1;
+            assert!(guard < 30, "should have reached the bottom well before now");
+        }
+        assert_eq!(
+            v.quote_index.get(),
+            3,
+            "scroll alone gets stuck on post 3, one short of the last post"
+        );
+
+        // Further Down presses must still reach post 4, even though scroll
+        // itself doesn't move any more.
+        v.handle(Key::Down);
+        redraw(&v, &mut terminal);
+        assert_eq!(v.quote_index.get(), 4, "Down past the scroll ceiling reaches the last post");
+
+        v.handle(Key::Down);
+        redraw(&v, &mut terminal);
+        assert_eq!(v.quote_index.get(), 4, "can't move past the last post");
+
+        // Up unwinds that by hand, one post at a time...
+        v.handle(Key::Up);
+        redraw(&v, &mut terminal);
+        assert_eq!(v.quote_index.get(), 3);
+
+        // ...and once it's back where scroll alone would've put it, a
+        // further Up must resume genuinely scrolling back up, not stay
+        // stuck at the same scroll position.
+        let scroll_before = v.scroll.get().min(v.max_scroll());
+        v.handle(Key::Up);
+        redraw(&v, &mut terminal);
+        assert!(
+            v.scroll.get().min(v.max_scroll()) < scroll_before,
+            "Up resumes real scrolling once quote_index rejoins the derived value"
+        );
     }
 
     #[test]
