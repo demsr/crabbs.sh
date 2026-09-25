@@ -40,6 +40,19 @@ impl TextArea {
             .join("\n")
     }
 
+    /// Replaces the contents, e.g. to prefill a reply with a quote. Goes
+    /// through the same per-character path as interactive typing, so it
+    /// gets the same word-wrap (and the same URL exemption) rather than
+    /// dropping in one giant unwrapped line.
+    pub fn set_text(&mut self, text: &str) {
+        self.lines = vec![Vec::new()];
+        self.row = 0;
+        self.col = 0;
+        for c in text.chars() {
+            self.handle(if c == '\n' { Key::Enter } else { Key::Char(c) });
+        }
+    }
+
     fn len(&self) -> usize {
         self.lines.iter().map(|l| l.len() + 1).sum::<usize>() - 1
     }
@@ -181,6 +194,30 @@ impl TextArea {
     }
 }
 
+// ---------------------------------------------------------------- quote
+
+/// Classic BBS/email reply quoting: an attribution line, then each line of
+/// the original prefixed with "> " (a bare ">" for a blank line, so
+/// paragraph breaks stay visible), then a blank line to write into.
+pub fn quote(author: &str, created: &str, body: &str) -> String {
+    let mut out = format!("On {created}, {author} wrote:\n");
+    for line in body.lines() {
+        if line.is_empty() {
+            out.push('>');
+        } else {
+            out.push_str("> ");
+            out.push_str(line);
+        }
+        out.push('\n');
+    }
+    // A second '\n': the first ends the last quoted line, this one opens a
+    // blank separator line, and the cursor lands on the line right after
+    // that - so there's one clear empty line between the quote and where
+    // the reply starts, not the reply running on immediately after ">...".
+    out.push('\n');
+    out
+}
+
 // -------------------------------------------------------------- Compose
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -223,12 +260,19 @@ impl Compose {
         }
     }
 
-    pub fn reply(thread_id: i64, thread_title: &str) -> Self {
+    /// `quoted` is the post being replied to (author, when, body), if any -
+    /// absent only if the thread turned out to have no posts, which
+    /// shouldn't normally happen.
+    pub fn reply(thread_id: i64, thread_title: &str, quoted: Option<(&str, &str, &str)>) -> Self {
+        let mut body = TextArea::new(content::BODY_MAX);
+        if let Some((author, created, text)) = quoted {
+            body.set_text(&quote(author, created, text));
+        }
         Self {
             kind: Kind::Reply { thread_id },
             heading: format!("Reply to: {thread_title}"),
             title: TextInput::new(0, false),
-            body: TextArea::new(content::BODY_MAX),
+            body,
             focus: Focus::Body,
             error: None,
             busy: false,
@@ -342,6 +386,37 @@ mod tests {
         for c in s.chars() {
             area.handle(if c == '\n' { Key::Enter } else { Key::Char(c) });
         }
+    }
+
+    #[test]
+    fn quote_formats_attribution_and_prefixes_every_line() {
+        let q = quote("alice", "2026-09-25 12:00", "hello\n\nworld");
+        assert_eq!(
+            q,
+            "On 2026-09-25 12:00, alice wrote:\n> hello\n>\n> world\n\n"
+        );
+        // Blank quoted lines are a bare ">", not "> " with trailing
+        // whitespace that would just get trimmed on the way to storage.
+        assert!(q.lines().any(|l| l == ">"));
+        // Ends with a blank line separating the quote from where the
+        // reply's own text will start, not running on right after it.
+        assert!(q.ends_with("world\n\n"));
+    }
+
+    #[test]
+    fn reply_prefills_the_body_with_a_quote_ready_to_type_after() {
+        let c = Compose::reply(9, "Some thread", Some(("alice", "2026-09-25 12:00", "hi there")));
+        assert_eq!(
+            c.body.value(),
+            "On 2026-09-25 12:00, alice wrote:\n> hi there\n\n"
+        );
+        assert!(matches!(c.focus, Focus::Body));
+    }
+
+    #[test]
+    fn reply_without_a_quote_leaves_the_body_empty() {
+        let c = Compose::reply(9, "Some thread", None);
+        assert!(c.body.value().is_empty());
     }
 
     #[test]

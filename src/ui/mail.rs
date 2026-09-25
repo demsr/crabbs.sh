@@ -206,7 +206,11 @@ impl MailboxScreen {
 pub enum MessageEvent {
     None,
     Back(Folder),
-    Reply { to: String, subject: String },
+    Reply {
+        to: String,
+        subject: String,
+        quote: (String, String, String),
+    },
     Delete(i64),
     Block(String),
 }
@@ -268,6 +272,11 @@ impl MessageScreen {
                 return MessageEvent::Reply {
                     to: self.message.from.clone(),
                     subject: reply_subject(&self.message.subject),
+                    quote: (
+                        self.message.from.clone(),
+                        self.message.created.clone(),
+                        self.message.body.clone(),
+                    ),
                 };
             }
             Key::Char('d') | Key::Delete => self.confirm = Some(Confirm::Delete),
@@ -376,8 +385,10 @@ pub struct MailCompose {
 }
 
 impl MailCompose {
-    /// `to`/`subject` prefill a reply; the cursor then starts in the body.
-    pub fn new(to: Option<&str>, subject: Option<&str>) -> Self {
+    /// `to`/`subject` prefill a reply; `quote`, if given, prefills the body
+    /// with the quoted original (author, when, body) and the cursor starts
+    /// in the body either way once both `to` and `subject` are already set.
+    pub fn new(to: Option<&str>, subject: Option<&str>, quote: Option<(&str, &str, &str)>) -> Self {
         let mut to_field = TextInput::new(crate::auth::USERNAME_MAX, false);
         let mut subject_field = TextInput::new(content::SUBJECT_MAX, false);
         if let Some(to) = to {
@@ -385,6 +396,10 @@ impl MailCompose {
         }
         if let Some(subject) = subject {
             subject_field.set(subject);
+        }
+        let mut body = TextArea::new(content::BODY_MAX);
+        if let Some((author, created, text)) = quote {
+            body.set_text(&super::compose::quote(author, created, text));
         }
         Self {
             focus: match (to, subject) {
@@ -394,7 +409,7 @@ impl MailCompose {
             },
             to: to_field,
             subject: subject_field,
-            body: TextArea::new(content::BODY_MAX),
+            body,
             error: None,
             busy: false,
         }
@@ -623,7 +638,9 @@ mod tests {
     #[test]
     fn message_actions_depend_on_which_copy_you_hold() {
         let mut inbox = MessageScreen::new(message(true));
-        assert!(matches!(inbox.handle(Key::Char('r')), MessageEvent::Reply { ref to, ref subject } if to == "alice" && subject == "Re: Hi"));
+        let event = inbox.handle(Key::Char('r'));
+        assert!(matches!(&event, MessageEvent::Reply { to, subject, .. } if to == "alice" && subject == "Re: Hi"));
+        assert!(matches!(&event, MessageEvent::Reply { quote, .. } if quote == &("alice".to_string(), "2026-01-01 00:00".to_string(), "text".to_string())));
         inbox.handle(Key::Char('b'));
         assert!(matches!(inbox.handle(Key::Char('y')), MessageEvent::Block(ref n) if n == "alice"));
         assert!(matches!(inbox.handle(Key::Esc), MessageEvent::Back(Folder::Inbox)));
@@ -639,7 +656,7 @@ mod tests {
 
     #[test]
     fn compose_validates_before_sending() {
-        let mut c = MailCompose::new(None, None);
+        let mut c = MailCompose::new(None, None, None);
         assert!(matches!(c.handle(Key::Ctrl('d')), MailComposeEvent::None));
         assert_eq!(c.focus, 0, "recipient missing");
 
@@ -663,8 +680,22 @@ mod tests {
 
     #[test]
     fn replies_start_in_the_body_with_fields_prefilled() {
-        let c = MailCompose::new(Some("alice"), Some("Re: Hi"));
+        let c = MailCompose::new(Some("alice"), Some("Re: Hi"), None);
         assert_eq!((c.to.value().as_str(), c.subject.value().as_str(), c.focus), ("alice", "Re: Hi", 2));
+        assert!(c.body.value().is_empty(), "no quote given, so no prefilled body");
+    }
+
+    #[test]
+    fn reply_quotes_the_original_message() {
+        let c = MailCompose::new(
+            Some("alice"),
+            Some("Re: Hi"),
+            Some(("alice", "2026-01-01 00:00", "line one\nline two")),
+        );
+        assert_eq!(
+            c.body.value(),
+            "On 2026-01-01 00:00, alice wrote:\n> line one\n> line two\n\n"
+        );
     }
 
     #[test]

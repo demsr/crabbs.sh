@@ -123,7 +123,8 @@ tool for everything else (renaming, reordering, deleting - see
 - Thread list: `n` starts a new thread, `m` marks the whole board as read,
   ←/→ (or `,` `.`) change page
 - Thread view: ↑/↓ scroll, `r` to reply, Esc back (to the list page you came
-  from); Space/PgDn reads on, ←/→ change page, `g`/`G` first/last page
+  from); Space/PgDn reads on, ←/→ change page, `g`/`G` first/last page. `r`
+  quotes the most recent post on the page you're viewing (see Quoting below)
 - Editor: type normally (lines word-wrap at 78 columns), **Ctrl-D** posts,
   Esc cancels, Tab indents (4 spaces), Shift-Tab jumps back to the title,
   and Enter in the title moves to the message. Spacing and indentation are
@@ -147,6 +148,26 @@ All text is sanitised on the server (control characters and bidi/zero-width
 characters removed) regardless of what the client sent. Whitespace is kept
 as typed, apart from trailing spaces, tabs (expanded to 4 spaces), runs of
 more than 3 blank lines and blank lines at the start or end of a post.
+
+### Quoting
+
+Replying (`r`, in a thread or reading a message) prefills the editor with
+the original, classic BBS/email style:
+
+```
+On 2026-01-01 12:00, alice wrote:
+> whatever alice wrote,
+> each line prefixed with "> "
+
+<cursor starts here>
+```
+
+For mail this is always the message you're reading. For boards - which are
+flat, not threaded - it's the most recent post on the page you're currently
+viewing; open an earlier page first to quote something further back instead.
+Trim or delete what you don't need, same as any other typed text; there's no
+length limit specific to the quote, just the normal 2000-character cap on
+the whole message.
 
 ### Unread markers
 
@@ -207,8 +228,9 @@ pressing anything.
 - Composing: To (a username, any capitalisation), Subject, Message. Ctrl-D
   sends, Esc cancels, Tab moves between fields. The message follows the same
   rules as posts (up to 2000 characters, spacing and indentation kept).
-- Reading a message marks it read. `r` replies (recipient and "Re:" subject
-  prefilled), `d` deletes, `b` blocks the sender.
+- Reading a message marks it read. `r` replies (recipient, "Re:" subject and
+  a quote of the message all prefilled - see Quoting below), `d` deletes,
+  `b` blocks the sender.
 - Each side deletes only its own copy; a message disappears from the database
   once both have deleted it.
 - **Blocking:** a blocked user's mail is refused ("You can't send messages to

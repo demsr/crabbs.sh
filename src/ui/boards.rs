@@ -605,7 +605,13 @@ pub enum ThreadEvent {
     None,
     DeletePost { post_id: i64, page: usize },
     Back { board_id: i64, list_page: usize },
-    Reply { thread_id: i64, title: String },
+    Reply {
+        thread_id: i64,
+        title: String,
+        /// The post being replied to (author, when, body) - the last one
+        /// currently loaded, i.e. the most recent on this page.
+        quote: Option<(String, String, String)>,
+    },
     /// Show another page of this thread.
     Goto { thread_id: i64, target: PageTarget },
 }
@@ -758,6 +764,10 @@ impl ThreadView {
                 return ThreadEvent::Reply {
                     thread_id: self.thread_id,
                     title: self.title.clone(),
+                    quote: self
+                        .posts
+                        .last()
+                        .map(|p| (p.author.clone(), p.created.clone(), p.body.clone())),
                 };
             }
             Key::Up | Key::Char('k') => self.scroll_by(-1),
@@ -1036,7 +1046,23 @@ mod tests {
     fn back_and_reply_carry_the_right_context() {
         let mut v = view(1, 3, false);
         assert!(matches!(v.handle(Key::Esc), ThreadEvent::Back { board_id: 1, list_page: 2 }));
-        assert!(matches!(v.handle(Key::Char('r')), ThreadEvent::Reply { thread_id: 9, .. }));
+        let event = v.handle(Key::Char('r'));
+        assert!(matches!(&event, ThreadEvent::Reply { thread_id: 9, .. }));
+        assert!(matches!(&event, ThreadEvent::Reply { quote: Some((a, c, b)), .. }
+            if a == "a" && c.is_empty() && b == "x"));
+    }
+
+    #[test]
+    fn reply_quotes_the_last_post_on_the_page_not_the_first() {
+        let mut v = view(0, 1, false);
+        v.posts[0].body = "first post".into();
+        v.posts[0].author = "alice".into();
+        let last = v.posts.len() - 1;
+        v.posts[last].body = "most recent post".into();
+        v.posts[last].author = "bob".into();
+        let event = v.handle(Key::Char('r'));
+        assert!(matches!(&event, ThreadEvent::Reply { quote: Some((a, _, b)), .. }
+            if a == "bob" && b == "most recent post"));
     }
 
     #[test]

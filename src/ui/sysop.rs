@@ -111,9 +111,7 @@ impl MotdEditor {
     /// Loads the current text from the server. Called once, when it arrives.
     pub fn set_text(&mut self, text: &str) {
         self.body = TextArea::new(content::MOTD_MAX);
-        for c in text.chars() {
-            self.body.handle(if c == '\n' { Key::Enter } else { Key::Char(c) });
-        }
+        self.body.set_text(text);
         self.loaded = true;
         self.busy = false;
     }
