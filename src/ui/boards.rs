@@ -4,9 +4,10 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
 
-use super::input::Key;
+use super::input::{Key, TextInput};
 use super::text::{Counter, wrap};
 use super::{BoardInfo, PageTarget, ThreadDetail, ThreadInfo};
+use crate::content;
 use crate::db::POSTS_PER_PAGE;
 
 const HIGHLIGHT: Style = Style::new()
@@ -48,20 +49,186 @@ pub enum BoardsEvent {
     None,
     Back,
     Open(i64),
+    CreateBoard { name: String, description: String },
+    UpdateDescription { board_id: i64, description: String },
+}
+
+/// What a board create/edit form does when Enter is pressed on its last
+/// field or Esc is pressed.
+enum FormOutcome {
+    None,
+    Cancel,
+    Submit,
+}
+
+/// "Create a board": name + description. Fields only; validation and the
+/// actual request are assembled by `BoardList`, which knows which event to
+/// return.
+struct NewBoardForm {
+    name: TextInput,
+    description: TextInput,
+    focus: usize,
+    error: Option<String>,
+    busy: bool,
+}
+
+impl NewBoardForm {
+    fn new() -> Self {
+        Self {
+            name: TextInput::new(content::TITLE_MAX, false),
+            description: TextInput::new(content::TITLE_MAX, false),
+            focus: 0,
+            error: None,
+            busy: false,
+        }
+    }
+
+    fn field(&mut self) -> &mut TextInput {
+        match self.focus {
+            0 => &mut self.name,
+            _ => &mut self.description,
+        }
+    }
+
+    fn fail(&mut self, message: String) {
+        self.busy = false;
+        self.error = Some(message);
+    }
+
+    fn handle(&mut self, key: Key) -> FormOutcome {
+        if self.busy {
+            return FormOutcome::None;
+        }
+        match key {
+            Key::Esc => return FormOutcome::Cancel,
+            Key::Tab | Key::Down | Key::BackTab | Key::Up => self.focus = 1 - self.focus,
+            Key::Enter if self.focus == 0 => self.focus = 1,
+            Key::Enter => {
+                if self.name.value().trim().is_empty() {
+                    self.focus = 0;
+                    self.error = Some("Give the board a name.".into());
+                    return FormOutcome::None;
+                }
+                self.error = None;
+                self.busy = true;
+                return FormOutcome::Submit;
+            }
+            other => {
+                self.field().handle(other);
+            }
+        }
+        FormOutcome::None
+    }
+
+    fn draw(&self, frame: &mut Frame, area: Rect) {
+        let rows = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(3), Constraint::Length(3), Constraint::Length(2)])
+            .split(area);
+        self.name.render(frame, rows[0], "Board name", self.focus == 0);
+        self.description
+            .render(frame, rows[1], "Description (optional)", self.focus == 1);
+        let (text, color) = if self.busy {
+            ("Creating…".to_string(), Color::Yellow)
+        } else if let Some(err) = &self.error {
+            (err.clone(), Color::Red)
+        } else {
+            ("Tab/Enter: next field · Enter on description: create · Esc: cancel".to_string(), Color::Gray)
+        };
+        frame.render_widget(Paragraph::new(text).style(Style::new().fg(color)), rows[2]);
+    }
+}
+
+/// "Edit board description": one field, prefilled.
+struct EditBoardForm {
+    board_id: i64,
+    board_name: String,
+    description: TextInput,
+    error: Option<String>,
+    busy: bool,
+}
+
+impl EditBoardForm {
+    fn new(board_id: i64, board_name: String, current_description: &str) -> Self {
+        let mut description = TextInput::new(content::TITLE_MAX, false);
+        description.set(current_description);
+        Self {
+            board_id,
+            board_name,
+            description,
+            error: None,
+            busy: false,
+        }
+    }
+
+    fn fail(&mut self, message: String) {
+        self.busy = false;
+        self.error = Some(message);
+    }
+
+    fn handle(&mut self, key: Key) -> FormOutcome {
+        if self.busy {
+            return FormOutcome::None;
+        }
+        match key {
+            Key::Esc => return FormOutcome::Cancel,
+            Key::Enter => {
+                self.error = None;
+                self.busy = true;
+                return FormOutcome::Submit;
+            }
+            other => {
+                self.description.handle(other);
+            }
+        }
+        FormOutcome::None
+    }
+
+    fn draw(&self, frame: &mut Frame, area: Rect) {
+        let rows = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(3), Constraint::Length(2)])
+            .split(area);
+        self.description.render(
+            frame,
+            rows[0],
+            &format!("Description of \"{}\"", self.board_name),
+            true,
+        );
+        let (text, color) = if self.busy {
+            ("Saving…".to_string(), Color::Yellow)
+        } else if let Some(err) = &self.error {
+            (err.clone(), Color::Red)
+        } else {
+            ("Enter: save · Esc: cancel".to_string(), Color::Gray)
+        };
+        frame.render_widget(Paragraph::new(text).style(Style::new().fg(color)), rows[1]);
+    }
+}
+
+enum Mode {
+    List,
+    New(NewBoardForm),
+    Edit(EditBoardForm),
 }
 
 pub struct BoardList {
     boards: Vec<BoardInfo>,
     selected: usize,
     loaded: bool,
+    /// Shows board-management keys. Purely cosmetic: the server decides.
+    sysop: bool,
+    mode: Mode,
 }
 
 impl BoardList {
-    pub fn new() -> Self {
+    pub fn new(sysop: bool) -> Self {
         Self {
             boards: Vec::new(),
             selected: 0,
             loaded: false,
+            sysop,
+            mode: Mode::List,
         }
     }
 
@@ -69,14 +236,75 @@ impl BoardList {
         self.boards = boards;
         self.loaded = true;
         self.selected = self.selected.min(self.boards.len().saturating_sub(1));
+        // A fresh list means whatever create/edit action was pending (if
+        // any) has already been handled - either it succeeded and this is
+        // the result, or something else refreshed the list.
+        self.mode = Mode::List;
+    }
+
+    /// The server rejected a create/edit; let the open form show why.
+    pub fn fail(&mut self, message: String) {
+        match &mut self.mode {
+            Mode::New(form) => form.fail(message),
+            Mode::Edit(form) => form.fail(message),
+            Mode::List => {}
+        }
     }
 
     pub fn handle(&mut self, key: Key) -> BoardsEvent {
+        match &mut self.mode {
+            Mode::List => self.handle_list(key),
+            Mode::New(form) => match form.handle(key) {
+                FormOutcome::None => BoardsEvent::None,
+                FormOutcome::Cancel => {
+                    self.mode = Mode::List;
+                    BoardsEvent::None
+                }
+                FormOutcome::Submit => {
+                    let Mode::New(form) = &self.mode else {
+                        unreachable!()
+                    };
+                    BoardsEvent::CreateBoard {
+                        name: form.name.value(),
+                        description: form.description.value(),
+                    }
+                }
+            },
+            Mode::Edit(form) => match form.handle(key) {
+                FormOutcome::None => BoardsEvent::None,
+                FormOutcome::Cancel => {
+                    self.mode = Mode::List;
+                    BoardsEvent::None
+                }
+                FormOutcome::Submit => {
+                    let Mode::Edit(form) = &self.mode else {
+                        unreachable!()
+                    };
+                    BoardsEvent::UpdateDescription {
+                        board_id: form.board_id,
+                        description: form.description.value(),
+                    }
+                }
+            },
+        }
+    }
+
+    fn handle_list(&mut self, key: Key) -> BoardsEvent {
         match key {
             Key::Esc | Key::Char('q') => return BoardsEvent::Back,
             Key::Enter => {
                 if let Some(board) = self.boards.get(self.selected) {
                     return BoardsEvent::Open(board.id);
+                }
+            }
+            Key::Char('n') if self.sysop => self.mode = Mode::New(NewBoardForm::new()),
+            Key::Char('e') if self.sysop => {
+                if let Some(board) = self.boards.get(self.selected) {
+                    self.mode = Mode::Edit(EditBoardForm::new(
+                        board.id,
+                        board.name.clone(),
+                        &board.description,
+                    ));
                 }
             }
             other => move_selection(&mut self.selected, self.boards.len(), other),
@@ -85,6 +313,18 @@ impl BoardList {
     }
 
     pub fn draw(&self, frame: &mut Frame, area: Rect) {
+        match &self.mode {
+            Mode::New(form) => {
+                form.draw(frame, area);
+                return;
+            }
+            Mode::Edit(form) => {
+                form.draw(frame, area);
+                return;
+            }
+            Mode::List => {}
+        }
+
         let (body, help) = split_help(area);
         let items: Vec<ListItem> = if !self.loaded {
             vec![ListItem::new("Loading…")]
@@ -125,7 +365,15 @@ impl BoardList {
             state.select(Some(self.selected));
         }
         frame.render_stateful_widget(list, body, &mut state);
-        draw_help(frame, help, "Enter: open board · ↑/↓: move · Esc: back");
+        if self.sysop {
+            draw_help(
+                frame,
+                help,
+                "Enter: open board · n: new board · e: edit description (sysop) · ↑/↓: move · Esc: back",
+            );
+        } else {
+            draw_help(frame, help, "Enter: open board · ↑/↓: move · Esc: back");
+        }
     }
 }
 

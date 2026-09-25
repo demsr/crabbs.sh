@@ -114,8 +114,10 @@ stored). A sysop with shell access resets it with `bbsadmin user passwd`.
 
 Main menu → **Message boards**. Boards contain threads, threads contain posts.
 Everyone (including guests) can read; only registered users can post.
-Three boards (General, Tech, Off-Topic) are created on first start; manage
-boards with the admin tool (below).
+Three boards (General, Tech, Off-Topic) are created on first start; sysops
+can add more and edit descriptions from within the BBS, or use the admin
+tool for everything else (renaming, reordering, deleting - see
+"Sysops and administration" below).
 
 - Board list / thread list: ↑/↓, Enter to open, Esc to go back
 - Thread list: `n` starts a new thread, `m` marks the whole board as read,
@@ -229,17 +231,35 @@ named. `r` refreshes the snapshot.
 
 ## Sysops and administration
 
-Administration is split in two, on purpose:
+Administration is split in two:
 
-- **Inside the BBS** a sysop can moderate content in context: `x` in a
-  thread list deletes the selected thread (after confirmation), `x` in a
-  thread asks for a post number (the thread-wide `#` shown on the post, which
-  must be on the page you're viewing) and deletes that post; you stay on the
-  same page. Sysop posts carry a `[sysop]` badge. Everything else stays out of the public SSH interface.
+- **Inside the BBS**, over SSH, for day-to-day tasks that don't need shell
+  access:
+  - Content moderation, in context: `x` in a thread list deletes the
+    selected thread (after confirmation); `x` in a thread asks for a post
+    number (the thread-wide `#` shown on the post, which must be on the page
+    you're viewing) and deletes that post, staying on the same page. Sysop
+    posts carry a `[sysop]` badge.
+  - Board management, in **Message boards**: `n` creates a board (name +
+    optional description), `e` edits the selected board's description.
+    Renaming, reordering and deleting a board are still `bbsadmin`-only (see
+    below).
+  - **Sysop tools**, a menu item of its own (main menu, sysops only): right
+    now just the message of the day - free text, shown once to everyone
+    (guests included) right after they log in; clearing it removes it.
+    Meant to grow further as more sysop-only, non-content-specific functions
+    get added.
 - **`bbsadmin`** is a command-line tool for everything else, run on the
   host with shell access. It works directly on the SQLite database using the
   same code as the server, and can run while the server is up; changes apply
   immediately.
+
+The **Sysop tools** menu item and the board-management hints only appear for
+someone who *was already* a sysop when their current session started -
+that's a client-side convenience, not the actual check. `bbsadmin promote`
+takes effect on their *next* login for what the menu shows, but immediately
+for what the server actually allows: every moderation action and board edit
+re-reads the role from the database at the time, same as bans (below).
 
 ```
 cargo run --bin bbsadmin -- <command>        # or ./target/release/bbsadmin
@@ -325,25 +345,29 @@ account from the database, so a demotion or ban takes effect at once.
 - `src/state.rs` — state shared by all connections (DB, rate limiter,
   who's-online registry, session `Identity`)
 - `src/db.rs` — SQLite schema, migrations and queries (`users`, `ssh_keys`,
-  `boards`, `threads`, `posts`, `thread_reads`, `messages`, `blocks`),
-  including everything the admin tool uses
-- `src/boards.rs` — board requests: permission checks, validation, rate
-  limiting; calls into `db.rs`
+  `boards`, `threads`, `posts`, `thread_reads`, `messages`, `blocks`,
+  `motd`), including everything the admin tool uses
+- `src/boards.rs` — board and moderation requests: permission checks,
+  validation, rate limiting; calls into `db.rs`. `require_sysop` there is
+  reused by `sysop.rs`
+- `src/sysop.rs` — sysop-only requests that aren't tied to a piece of
+  content (currently just the message of the day)
 - `src/chat.rs` — the chat room: membership, history, sequenced broadcast
 - `src/mail.rs` — mail requests: permissions, validation, limits, delivery
   notices
-- `src/content.rs` — sanitising and limits for titles, post bodies and chat
-  lines
+- `src/content.rs` — sanitising and limits for titles, post/MOTD bodies and
+  chat lines
 - `src/auth.rs` — username/password validation, Argon2, public-key parsing
 - `src/terminal.rs` — adapts an SSH channel into an `io::Write` sink
 - `src/ui/` — the terminal UI. `App` in `mod.rs` is a small screen state
   machine; it is synchronous and asks the server to do async work by
   returning a `Request`, then receives a `Response`. `input.rs` parses raw
   bytes into keys and has the text-field widget; `register.rs` and
-  `keys.rs`, `boards.rs` (board list, thread list, thread view),
-  `compose.rs` (multi-line editor and compose screen), `online.rs`,
-  `chat.rs` (the chat screen), `password.rs` and `mail.rs` (mailbox, message
-  view, compose, blocked list) are screens.
+  `keys.rs`, `boards.rs` (board list plus its sysop-only create/edit-
+  description forms, thread list, thread view), `compose.rs` (multi-line
+  editor and compose screen), `online.rs`, `chat.rs` (the chat screen),
+  `password.rs`, `mail.rs` (mailbox, message view, compose, blocked list)
+  and `sysop.rs` (the Sysop tools hub and the MOTD editor) are screens.
 
 ### Adding a screen
 

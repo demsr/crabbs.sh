@@ -6,6 +6,7 @@
 pub const TITLE_MIN: usize = 3;
 pub const TITLE_MAX: usize = 80;
 pub const BODY_MAX: usize = 2000;
+pub const MOTD_MAX: usize = 4000;
 pub const CHAT_MAX: usize = 300;
 pub const SUBJECT_MAX: usize = 80;
 /// Column at which the post editor word-wraps: the widest a line can be and
@@ -47,11 +48,12 @@ pub fn clean_title(raw: &str) -> Result<String, String> {
     Ok(title)
 }
 
-/// Multi-line text. Indentation and inner spacing are kept exactly (people
-/// post ASCII art and code); what changes is: tabs become spaces, control
-/// characters are dropped, trailing whitespace is trimmed, runs of blank
-/// lines are limited, and blank lines at the very start and end are removed.
-pub fn clean_body(raw: &str) -> Result<String, String> {
+/// Shared by `clean_body` and `clean_motd`: normalises line endings, strips
+/// control/bidi/zero-width characters, expands tabs, trims trailing
+/// whitespace per line, caps consecutive blank lines, and trims blank lines
+/// from the start and end. Indentation and inner spacing are otherwise kept
+/// exactly, so ASCII art and code survive.
+fn clean_lines(raw: &str) -> Vec<String> {
     let normalized = raw.replace("\r\n", "\n").replace('\r', "\n");
     let mut lines: Vec<String> = Vec::new();
     let mut blank_run = 0;
@@ -81,6 +83,13 @@ pub fn clean_body(raw: &str) -> Result<String, String> {
     while lines.last().is_some_and(|l| l.is_empty()) {
         lines.pop();
     }
+    lines
+}
+
+/// Multi-line text for a post or message: same cleaning as `clean_motd`, but
+/// empty is rejected (there's nothing sensible to post) and capped shorter.
+pub fn clean_body(raw: &str) -> Result<String, String> {
+    let lines = clean_lines(raw);
     if lines.is_empty() {
         return Err("The message is empty.".into());
     }
@@ -89,6 +98,17 @@ pub fn clean_body(raw: &str) -> Result<String, String> {
         return Err(format!("Messages can be at most {BODY_MAX} characters."));
     }
     Ok(body)
+}
+
+/// The message of the day: same cleaning as `clean_body`, but empty is fine
+/// (that's how a sysop clears it) and the length budget is more generous,
+/// since it's static text a sysop chose deliberately rather than a post.
+pub fn clean_motd(raw: &str) -> Result<String, String> {
+    let text = clean_lines(raw).join("\n");
+    if text.chars().count() > MOTD_MAX {
+        return Err(format!("The MOTD can be at most {MOTD_MAX} characters."));
+    }
+    Ok(text)
 }
 
 /// A mail subject: like a title, but a single character is enough.
@@ -173,6 +193,16 @@ mod tests {
         assert_eq!(clean_subject("x").unwrap(), "x");
         assert!(clean_subject("   ").is_err());
         assert!(clean_subject(&"x".repeat(SUBJECT_MAX + 1)).is_err());
+    }
+
+    #[test]
+    fn motd_allows_empty_and_keeps_formatting() {
+        assert_eq!(clean_motd("").unwrap(), "", "empty clears the MOTD, not an error");
+        assert_eq!(clean_motd("   \n\t \n").unwrap(), "");
+        let banner = "  Welcome!\n  Be nice to each other.";
+        assert_eq!(clean_motd(banner).unwrap(), banner);
+        assert!(clean_motd(&"x".repeat(MOTD_MAX + 1)).is_err());
+        assert!(clean_motd(&"x".repeat(MOTD_MAX)).is_ok());
     }
 
     #[test]

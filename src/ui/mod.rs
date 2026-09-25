@@ -1,6 +1,7 @@
 mod boards;
 mod chat;
 mod compose;
+mod sysop;
 mod input;
 mod keys;
 mod mail;
@@ -29,6 +30,7 @@ use mail::{
     BlocksEvent, BlocksScreen, MailCompose, MailComposeEvent, MailboxEvent, MailboxScreen,
     MessageEvent, MessageScreen,
 };
+use sysop::{MotdEditor, MotdEvent, SysopMenu, SysopMenuEvent};
 use online::{OnlineEvent, OnlineScreen};
 use password::{PasswordEvent, PasswordForm};
 use register::{FormEvent, RegisterForm};
@@ -127,6 +129,22 @@ pub enum Request {
     UnblockUser {
         name: String,
     },
+    /// Sysop-only; the server checks.
+    CreateBoard {
+        name: String,
+        description: String,
+    },
+    /// Sysop-only; the server checks.
+    UpdateBoardDescription {
+        board_id: i64,
+        description: String,
+    },
+    /// Sysop-only; the server checks.
+    GetMotd,
+    /// Sysop-only; the server checks. Empty text clears the MOTD.
+    SetMotd {
+        text: String,
+    },
     /// Members only: enter the chat room. Answered with a snapshot.
     JoinChat,
     LeaveChat,
@@ -145,7 +163,10 @@ pub enum Response {
         /// Outcome of the add/delete that triggered this refresh, if any.
         notice: Option<Result<String, String>>,
     },
-    Boards(Vec<BoardInfo>),
+    Boards {
+        boards: Vec<BoardInfo>,
+        notice: Option<String>,
+    },
     Threads {
         board_id: i64,
         board_name: String,
@@ -192,6 +213,12 @@ pub enum Response {
     Nothing,
     /// A post was rejected; the compose screen stays open.
     PostFailed(String),
+    /// A sysop-only board or MOTD action was rejected.
+    SysopActionFailed(String),
+    Motd {
+        text: String,
+        notice: Option<String>,
+    },
     /// Something couldn't be loaded.
     Error(String),
 }
@@ -265,6 +292,7 @@ enum MenuItem {
     Register,
     Keys,
     Password,
+    SysopTools,
     About,
     LogOff,
 }
@@ -285,6 +313,7 @@ impl MenuItem {
             MenuItem::Register => "Register an account",
             MenuItem::Keys => "SSH keys",
             MenuItem::Password => "Change password",
+            MenuItem::SysopTools => "Sysop tools",
             MenuItem::About => "About this BBS",
             MenuItem::LogOff => "Log off",
         }
@@ -308,6 +337,11 @@ enum Screen {
     Message(MessageScreen),
     MailCompose(Box<MailComposeScreen>),
     Blocks(BlocksScreen),
+    SysopMenu(SysopMenu),
+    MotdEditor(MotdEditor),
+    /// The message of the day, shown once right after login. Any key
+    /// dismisses it and moves on to the main menu.
+    Motd(String),
 }
 
 /// Like `ComposeScreen`: remembers where to return if cancelled.
@@ -347,6 +381,14 @@ impl App {
 
     pub fn set_unread_mail(&mut self, count: i64) {
         self.unread_mail = count;
+    }
+
+    /// If a message of the day is set, shows it first instead of the menu.
+    /// Called once, right after construction.
+    pub fn set_motd(&mut self, text: Option<String>) {
+        if let Some(text) = text.filter(|t| !t.is_empty()) {
+            self.screen = Screen::Motd(text);
+        }
     }
 
     /// Mail was delivered somewhere. If it's for this user, note it. Returns
@@ -396,6 +438,8 @@ impl App {
             Screen::Password(_) => "Account settings",
             Screen::Mailbox(_) | Screen::Message(_) | Screen::Blocks(_) => "Reading mail",
             Screen::MailCompose(_) => "Writing mail",
+            Screen::SysopMenu(_) | Screen::MotdEditor(_) => "Sysop tools",
+            Screen::Motd(_) => "Reading the message of the day",
         }
     }
 
@@ -423,12 +467,17 @@ impl App {
         let mut items = vec![MenuItem::Board, MenuItem::Chat];
         match self.identity {
             Identity::Guest => items.extend([MenuItem::Online, MenuItem::Register]),
-            Identity::User { .. } => items.extend([
-                MenuItem::Mail,
-                MenuItem::Online,
-                MenuItem::Keys,
-                MenuItem::Password,
-            ]),
+            Identity::User { .. } => {
+                items.extend([
+                    MenuItem::Mail,
+                    MenuItem::Online,
+                    MenuItem::Keys,
+                    MenuItem::Password,
+                ]);
+                if self.identity.is_sysop() {
+                    items.push(MenuItem::SysopTools);
+                }
+            }
         }
         items.extend([MenuItem::About, MenuItem::LogOff]);
         items
@@ -474,12 +523,15 @@ impl App {
                     form.fail(message);
                 }
             }
-            Response::Boards(boards) => {
+            Response::Boards { boards, notice } => {
                 // The board list is refreshed whenever you come back to it,
                 // so it doubles as the source for the main-menu count.
                 self.unread_threads = boards.iter().map(|b| b.unread_threads).sum();
                 if let Screen::Boards(list) = &mut self.screen {
                     list.set(boards);
+                }
+                if let Some(text) = notice {
+                    self.set_status(text, false);
                 }
             }
             Response::Threads {
@@ -587,6 +639,19 @@ impl App {
                     screen.compose.fail(message);
                 }
             }
+            Response::SysopActionFailed(message) => match &mut self.screen {
+                Screen::Boards(list) => list.fail(message),
+                Screen::MotdEditor(editor) => editor.fail(message),
+                _ => self.set_status(message, true),
+            },
+            Response::Motd { text, notice } => {
+                if let Screen::MotdEditor(editor) = &mut self.screen {
+                    editor.set_text(&text);
+                }
+                if let Some(text) = notice {
+                    self.set_status(text, false);
+                }
+            }
             Response::Error(message) => self.set_status(message, true),
             Response::Keys { keys, notice } => {
                 let ok = !matches!(notice, Some(Err(_)));
@@ -619,6 +684,10 @@ impl App {
                 self.screen = Screen::Menu;
                 None
             }
+            Screen::Motd(_) => {
+                self.screen = Screen::Menu;
+                None
+            }
             Screen::Register(form) => match form.handle(key) {
                 FormEvent::None => None,
                 FormEvent::Cancel => {
@@ -639,6 +708,16 @@ impl App {
                     self.screen = Screen::Threads(ThreadList::loading(board_id, sysop, member));
                     Some(Action::Request(Request::ListThreads { board_id, page: 0 }))
                 }
+                BoardsEvent::CreateBoard { name, description } => {
+                    Some(Action::Request(Request::CreateBoard { name, description }))
+                }
+                BoardsEvent::UpdateDescription {
+                    board_id,
+                    description,
+                } => Some(Action::Request(Request::UpdateBoardDescription {
+                    board_id,
+                    description,
+                })),
             },
             Screen::Threads(list) => match list.handle(key) {
                 ThreadsEvent::None => None,
@@ -653,7 +732,7 @@ impl App {
                     Some(Action::Request(Request::ListThreads { board_id, page }))
                 }
                 ThreadsEvent::Back => {
-                    self.screen = Screen::Boards(BoardList::new());
+                    self.screen = Screen::Boards(BoardList::new(sysop));
                     Some(Action::Request(Request::ListBoards))
                 }
                 ThreadsEvent::Open {
@@ -807,6 +886,25 @@ impl App {
                 KeysEvent::Add(line) => Some(Action::Request(Request::AddKey(line))),
                 KeysEvent::Delete(id) => Some(Action::Request(Request::DeleteKey(id))),
             },
+            Screen::SysopMenu(menu) => match menu.handle(key) {
+                SysopMenuEvent::None => None,
+                SysopMenuEvent::Back => {
+                    self.screen = Screen::Menu;
+                    None
+                }
+                SysopMenuEvent::EditMotd => {
+                    self.screen = Screen::MotdEditor(MotdEditor::loading());
+                    Some(Action::Request(Request::GetMotd))
+                }
+            },
+            Screen::MotdEditor(editor) => match editor.handle(key) {
+                MotdEvent::None => None,
+                MotdEvent::Cancel => {
+                    self.screen = Screen::SysopMenu(SysopMenu::new());
+                    None
+                }
+                MotdEvent::Save(text) => Some(Action::Request(Request::SetMotd { text })),
+            },
         }
     }
 
@@ -853,7 +951,7 @@ impl App {
     fn activate(&mut self) -> Option<Action> {
         match self.menu_items()[self.selected] {
             MenuItem::Board => {
-                self.screen = Screen::Boards(BoardList::new());
+                self.screen = Screen::Boards(BoardList::new(self.identity.is_sysop()));
                 return Some(Action::Request(Request::ListBoards));
             }
             MenuItem::Chat => {
@@ -885,6 +983,7 @@ impl App {
                 self.screen = Screen::Keys(KeysScreen::new());
                 return Some(Action::Request(Request::ListKeys));
             }
+            MenuItem::SysopTools => self.screen = Screen::SysopMenu(SysopMenu::new()),
             MenuItem::About => self.screen = Screen::About,
             MenuItem::LogOff => return Some(Action::Quit),
         }
@@ -919,6 +1018,9 @@ impl App {
             Screen::Message(message) => message.draw(frame, body),
             Screen::MailCompose(screen) => screen.form.draw(frame, body),
             Screen::Blocks(blocks) => blocks.draw(frame, body),
+            Screen::SysopMenu(menu) => menu.draw(frame, body),
+            Screen::MotdEditor(editor) => editor.draw(frame, body),
+            Screen::Motd(text) => Self::draw_motd(text, frame, body),
         }
         self.draw_status(frame, chunks[2]);
     }
@@ -956,6 +1058,23 @@ impl App {
         let mut state = ListState::default();
         state.select(Some(self.selected));
         frame.render_stateful_widget(list, area, &mut state);
+    }
+
+    fn draw_motd(text: &str, frame: &mut Frame, area: Rect) {
+        let rows = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(3), Constraint::Length(1)])
+            .split(area);
+        frame.render_widget(
+            Paragraph::new(text.to_string())
+                .wrap(Wrap { trim: true })
+                .block(Block::default().title("Message of the day").borders(Borders::ALL)),
+            rows[0],
+        );
+        frame.render_widget(
+            Paragraph::new("Press any key to continue").style(Style::default().fg(Color::Gray)),
+            rows[1],
+        );
     }
 
     fn draw_about(frame: &mut Frame, area: Rect) {

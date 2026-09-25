@@ -11,5 +11,6 @@ pub mod db;
 pub mod mail;
 pub mod server;
 pub mod state;
+pub mod sysop;
 pub mod terminal;
 pub mod ui;

@@ -88,6 +88,15 @@ CREATE TABLE IF NOT EXISTS blocks (
     created_at INTEGER NOT NULL DEFAULT (unixepoch()),
     PRIMARY KEY (user_id, blocked_id)
 );
+
+-- Message of the day, shown once per connection right after login. A
+-- single row (id = 1); no row, or empty text, means nothing is shown.
+CREATE TABLE IF NOT EXISTS motd (
+    id         INTEGER PRIMARY KEY CHECK (id = 1),
+    text       TEXT NOT NULL DEFAULT '',
+    updated_at INTEGER NOT NULL DEFAULT (unixepoch()),
+    updated_by INTEGER REFERENCES users(id)
+);
 ";
 
 /// Created on first start, when there are no boards at all.
@@ -789,6 +798,27 @@ impl Db {
             params![thread_id],
         )?;
         tx.commit()?;
+        Ok(())
+    }
+
+    // ------------------------------------------------------------- motd
+
+    /// The current message of the day, or "" if none is set.
+    pub fn get_motd(&self) -> Result<String, DbError> {
+        Ok(self
+            .conn()
+            .query_row("SELECT text FROM motd WHERE id = 1", [], |r| r.get(0))
+            .optional()?
+            .unwrap_or_default())
+    }
+
+    pub fn set_motd(&self, text: &str, updated_by: i64) -> Result<(), DbError> {
+        self.conn().execute(
+            "INSERT INTO motd (id, text, updated_at, updated_by) VALUES (1, ?1, unixepoch(), ?2)
+             ON CONFLICT(id) DO UPDATE SET text = excluded.text, updated_at = excluded.updated_at,
+                 updated_by = excluded.updated_by",
+            params![text, updated_by],
+        )?;
         Ok(())
     }
 
@@ -1537,6 +1567,19 @@ mod tests {
         db.mark_thread_read_upto(bob, t, db.list_posts_page(t, Some(bob), 50, 100).unwrap().last().unwrap().id).unwrap();
         assert_eq!(db.first_unread_index(bob, t).unwrap(), None);
         assert_eq!(db.unread_thread_total(bob).unwrap(), 0);
+    }
+
+    #[test]
+    fn motd_defaults_empty_and_round_trips() {
+        let (db, alice, _, _) = alice_bob();
+        assert_eq!(db.get_motd().unwrap(), "");
+        db.set_motd("Welcome!\nBe nice.", alice).unwrap();
+        assert_eq!(db.get_motd().unwrap(), "Welcome!\nBe nice.");
+        // Setting again overwrites rather than erroring or duplicating.
+        db.set_motd("New text", alice).unwrap();
+        assert_eq!(db.get_motd().unwrap(), "New text");
+        db.set_motd("", alice).unwrap();
+        assert_eq!(db.get_motd().unwrap(), "");
     }
 
     #[test]

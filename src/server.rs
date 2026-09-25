@@ -19,7 +19,7 @@ use crate::state::{
 };
 use crate::terminal::TerminalHandle;
 use crate::ui::{Action, App, KeyInfo, OnlineInfo, Request, Response};
-use crate::{auth, boards, content, mail};
+use crate::{auth, boards, content, mail, sysop};
 
 type SshTerminal = Terminal<CrosstermBackend<TerminalHandle>>;
 
@@ -319,7 +319,7 @@ impl BbsHandler {
             Request::Register { username, password } => {
                 Response::Registered(self.register(username, password).await)
             }
-            Request::ListBoards => boards::list_boards(&self.shared, self.user_id()).await,
+            Request::ListBoards => boards::list_boards(&self.shared, self.user_id(), None).await,
             Request::ListThreads { board_id, page } => {
                 boards::list_threads(&self.shared, board_id, page, None, self.user_id()).await
             }
@@ -330,6 +330,30 @@ impl BbsHandler {
                 Some(identity) => {
                     boards::mark_board_read(&self.shared, identity, board_id, page).await
                 }
+                None => Response::Error(INTERNAL_ERROR.into()),
+            },
+            Request::CreateBoard { name, description } => match &self.identity {
+                Some(identity) => {
+                    boards::create_board(&self.shared, identity, name, description).await
+                }
+                None => Response::Error(INTERNAL_ERROR.into()),
+            },
+            Request::UpdateBoardDescription {
+                board_id,
+                description,
+            } => match &self.identity {
+                Some(identity) => {
+                    boards::update_board_description(&self.shared, identity, board_id, description)
+                        .await
+                }
+                None => Response::Error(INTERNAL_ERROR.into()),
+            },
+            Request::GetMotd => match &self.identity {
+                Some(identity) => sysop::get_motd(&self.shared, identity).await,
+                None => Response::Error(INTERNAL_ERROR.into()),
+            },
+            Request::SetMotd { text } => match &self.identity {
+                Some(identity) => sysop::set_motd(&self.shared, identity, text).await,
                 None => Response::Error(INTERNAL_ERROR.into()),
             },
             Request::WhoIsOnline => self.who_is_online(),
@@ -818,9 +842,12 @@ impl Handler for BbsHandler {
             Some(id) => mail::unread_count(&self.shared, id).await,
             None => 0,
         };
+        // Shown to everyone, guests included, once per connection.
+        let motd = self.shared.blocking(|s| s.db.get_motd()).await.ok();
         let mut app = App::new(identity);
         app.set_unread_threads(unread);
         app.set_unread_mail(unread_mail);
+        app.set_motd(motd);
         lock_ui(&self.ui).app = Some(app);
         self.join_online(session.handle());
         self.spawn_listener();

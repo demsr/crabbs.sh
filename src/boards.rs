@@ -19,10 +19,14 @@ pub async fn unread_total(shared: &Arc<Shared>, user_id: i64) -> i64 {
 }
 
 /// `viewer` is the logged-in user's id (guests have no read markers).
-pub async fn list_boards(shared: &Arc<Shared>, viewer: Option<i64>) -> Response {
+pub async fn list_boards(
+    shared: &Arc<Shared>,
+    viewer: Option<i64>,
+    notice: Option<String>,
+) -> Response {
     match shared.blocking(move |s| s.db.list_boards(viewer)).await {
-        Ok(boards) => Response::Boards(
-            boards
+        Ok(boards) => Response::Boards {
+            boards: boards
                 .into_iter()
                 .map(|b| BoardInfo {
                     id: b.id,
@@ -32,8 +36,90 @@ pub async fn list_boards(shared: &Arc<Shared>, viewer: Option<i64>) -> Response 
                     unread_threads: b.unread_threads,
                 })
                 .collect(),
-        ),
+            notice,
+        },
         Err(_) => Response::Error(INTERNAL_ERROR.into()),
+    }
+}
+
+/// Sysop-only: create a board. Appended after the existing ones.
+pub async fn create_board(
+    shared: &Arc<Shared>,
+    identity: &Identity,
+    name: String,
+    description: String,
+) -> Response {
+    if let Err(e) = require_sysop(shared, identity).await {
+        return Response::SysopActionFailed(e);
+    }
+    let name = match content::clean_title(&name) {
+        Ok(name) => name,
+        Err(e) => return Response::SysopActionFailed(e),
+    };
+    // An empty description is fine; a non-empty one still goes through the
+    // same title-shaped cleaning (single line, length-capped).
+    let description = if description.trim().is_empty() {
+        String::new()
+    } else {
+        match content::clean_title(&description) {
+            Ok(d) => d,
+            Err(e) => return Response::SysopActionFailed(e),
+        }
+    };
+    let shown = name.clone();
+    match shared
+        .blocking(move |s| s.db.create_board(&name, &description))
+        .await
+    {
+        Ok(_) => {
+            list_boards(
+                shared,
+                identity.user_id(),
+                Some(format!("Created board \"{shown}\".")),
+            )
+            .await
+        }
+        Err(DbError::Duplicate) => {
+            Response::SysopActionFailed(format!("A board named \"{shown}\" already exists."))
+        }
+        Err(_) => Response::SysopActionFailed(INTERNAL_ERROR.into()),
+    }
+}
+
+/// Sysop-only: change a board's description.
+pub async fn update_board_description(
+    shared: &Arc<Shared>,
+    identity: &Identity,
+    board_id: i64,
+    description: String,
+) -> Response {
+    if let Err(e) = require_sysop(shared, identity).await {
+        return Response::SysopActionFailed(e);
+    }
+    let description = if description.trim().is_empty() {
+        String::new()
+    } else {
+        match content::clean_title(&description) {
+            Ok(d) => d,
+            Err(e) => return Response::SysopActionFailed(e),
+        }
+    };
+    match shared
+        .blocking(move |s| s.db.update_board(board_id, None, Some(&description), None))
+        .await
+    {
+        Ok(()) => {
+            list_boards(
+                shared,
+                identity.user_id(),
+                Some("Board description updated.".into()),
+            )
+            .await
+        }
+        Err(DbError::NotFound) => {
+            Response::SysopActionFailed("That board no longer exists.".into())
+        }
+        Err(_) => Response::SysopActionFailed(INTERNAL_ERROR.into()),
     }
 }
 
@@ -176,7 +262,7 @@ pub(crate) async fn live_account(shared: &Arc<Shared>, identity: &Identity) -> R
 }
 
 /// Only sysops may moderate.
-async fn require_sysop(shared: &Arc<Shared>, identity: &Identity) -> Result<(), String> {
+pub(crate) async fn require_sysop(shared: &Arc<Shared>, identity: &Identity) -> Result<(), String> {
     match live_account(shared, identity).await? {
         account if account.role == Role::Sysop => Ok(()),
         _ => Err("Only sysops can do that.".into()),
