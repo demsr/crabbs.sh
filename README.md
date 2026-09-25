@@ -128,7 +128,10 @@ tool for everything else (renaming, reordering, deleting - see
   Esc cancels, Tab indents (4 spaces), Shift-Tab jumps back to the title,
   and Enter in the title moves to the message. Spacing and indentation are
   preserved, so ASCII art and code blocks work (lines up to 78 columns fit
-  an 80-column terminal)
+  an 80-column terminal). A single token with no space in it - a URL,
+  typically - is never split with an injected line break even past 78
+  columns, so it's never corrupted in storage; each reader's thread view
+  wraps it for display based on their own terminal width instead
 
 **Paging.** Thread lists show 25 threads per page (most recently active
 first, the title says `page 2/5 · 123 threads`) and threads show 25 posts per

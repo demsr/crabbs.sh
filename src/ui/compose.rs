@@ -10,7 +10,11 @@ use crate::content;
 // ------------------------------------------------------------- TextArea
 
 /// A small multi-line editor. Like classic BBS editors it word-wraps as you
-/// type at `WRAP_COLS`, so what you write is what gets stored.
+/// type at `WRAP_COLS`, so what you write is what gets stored - except for a
+/// single token with no space in it (a URL, typically), which is left
+/// intact rather than split with an injected line break that would corrupt
+/// it; display-time wrapping (console-width-aware, non-destructive) takes
+/// care of showing it readably instead.
 pub struct TextArea {
     lines: Vec<Vec<char>>,
     row: usize,
@@ -50,25 +54,22 @@ impl TextArea {
     fn insert_char(&mut self, c: char) {
         self.lines[self.row].insert(self.col, c);
         self.col += 1;
-        // Word-wrap when typing at the end of an overlong line.
+        // Word-wrap at the last space once a line runs long. A single
+        // unbreakable token - a URL, typically - is left alone rather than
+        // split with an injected line break: that would corrupt it in
+        // storage (and stay corrupted for every reader), not just look odd
+        // while typing. It just runs past WRAP_COLS instead (the render
+        // below already scrolls horizontally to follow the cursor), and a
+        // reader's own thread view wraps it for *display* based on their
+        // actual terminal width, without touching what's stored.
         let line = &self.lines[self.row];
         if self.col == line.len() && line.len() > content::WRAP_COLS {
-            let break_at = line.iter().rposition(|&ch| ch == ' ').filter(|&i| i > 0);
-            match break_at {
-                Some(i) => {
-                    let tail = self.lines[self.row].split_off(i + 1);
-                    self.lines[self.row].pop(); // the space we broke at
-                    self.col = tail.len();
-                    self.lines.insert(self.row + 1, tail);
-                    self.row += 1;
-                }
-                None => {
-                    // No space to break at: start a new line with this char.
-                    self.lines[self.row].pop();
-                    self.lines.insert(self.row + 1, vec![c]);
-                    self.row += 1;
-                    self.col = 1;
-                }
+            if let Some(i) = line.iter().rposition(|&ch| ch == ' ').filter(|&i| i > 0) {
+                let tail = self.lines[self.row].split_off(i + 1);
+                self.lines[self.row].pop(); // the space we broke at
+                self.col = tail.len();
+                self.lines.insert(self.row + 1, tail);
+                self.row += 1;
             }
         }
     }
@@ -359,17 +360,43 @@ mod tests {
     }
 
     #[test]
-    fn long_word_is_split() {
+    fn long_unbreakable_token_is_not_split() {
+        // A URL (or anything else with no space) must not come out of the
+        // editor with an injected line break in the middle of it: that
+        // would be stored, corrupting it for every future reader, not just
+        // a display artifact. It stays exactly as typed, however long.
         let mut area = TextArea::new(1000);
-        type_str(&mut area, &"x".repeat(content::WRAP_COLS + 10));
+        let long_token = "x".repeat(content::WRAP_COLS + 10);
+        type_str(&mut area, &long_token);
+        assert_eq!(area.value(), long_token);
+        assert_eq!(area.value().lines().count(), 1);
+    }
+
+    #[test]
+    fn url_survives_intact_among_ordinary_prose() {
+        let mut area = TextArea::new(1000);
+        let url = "https://store.rockstargames.com/de/merchandise/gtavi-goodtime-state-vice-city-collection";
+        type_str(&mut area, &format!("check this out:\n{url}\nlooks cool"));
+        let value = area.value();
+        assert!(value.contains(url), "the URL must appear byte-for-byte unbroken: {value:?}");
+        // Ordinary short lines around it still wrap/behave normally.
+        assert!(value.contains("check this out:"));
+        assert!(value.contains("looks cool"));
+    }
+
+    #[test]
+    fn wrapping_resumes_normally_right_after_an_unbreakable_token() {
+        // Once a natural break point (a space) appears again, normal
+        // word-wrap picks back up - the exemption is only for the run that
+        // has no space in it, not "everything from here on".
+        let mut area = TextArea::new(1000);
+        let long_token = "x".repeat(content::WRAP_COLS + 5);
+        type_str(&mut area, &format!("{long_token} {}", "word ".repeat(20)));
+        let value = area.value();
+        assert!(value.starts_with(&long_token));
         assert!(
-            area.value()
-                .lines()
-                .all(|l| l.chars().count() <= content::WRAP_COLS)
-        );
-        assert_eq!(
-            area.value().replace('\n', "").len(),
-            content::WRAP_COLS + 10
+            value.lines().skip(1).all(|l| l.chars().count() <= content::WRAP_COLS),
+            "wrapping resumed normally after the token: {value:?}"
         );
     }
 
