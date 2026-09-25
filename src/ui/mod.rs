@@ -679,9 +679,12 @@ impl App {
 
     fn handle_key(&mut self, key: Key) -> Option<Action> {
         self.status = None;
-        // Any key dismisses the popup, and only dismisses it - it's not
-        // otherwise handled by whatever screen is underneath.
-        if self.motd_popup.take().is_some() {
+        // Only Enter dismisses the popup; every other key is swallowed while
+        // it's up rather than reaching whatever screen is underneath.
+        if self.motd_popup.is_some() {
+            if key == Key::Enter {
+                self.motd_popup = None;
+            }
             return None;
         }
         let sysop = self.identity.is_sysop();
@@ -1074,12 +1077,12 @@ impl App {
     /// one-line MOTD doesn't look like an oversized empty box.
     fn draw_motd_popup(text: &str, frame: &mut Frame) {
         let full = frame.area();
-        let width = (full.width * 7 / 10)
-            .max(40.min(full.width))
+        let width = (full.width * 4 / 5)
+            .max(50.min(full.width))
             .min(full.width.saturating_sub(4).max(1));
         let wrapped = text::wrap(text, width.saturating_sub(2).max(1) as usize).len() as u16;
         let height = (wrapped + 3) // borders (2) + the hint line (1)
-            .max(6.min(full.height))
+            .max(12.min(full.height))
             .min((full.height * 4 / 5).max(1))
             .min(full.height);
         let area = Rect {
@@ -1089,10 +1092,15 @@ impl App {
             height,
         };
 
+        // An explicit, solid background (unlike the rest of the UI, which
+        // never sets one) so the popup reads as a panel raised over the
+        // menu instead of blending into the same terminal background.
+        let panel = Style::default().bg(Color::Black);
         frame.render_widget(Clear, area);
         let block = Block::default()
             .title(" Message of the day ")
-            .border_style(Style::default().fg(Color::Cyan))
+            .style(panel)
+            .border_style(panel.fg(Color::Cyan))
             .borders(Borders::ALL);
         let inner = block.inner(area);
         frame.render_widget(block, area);
@@ -1101,11 +1109,14 @@ impl App {
             .direction(Direction::Vertical)
             .constraints([Constraint::Min(0), Constraint::Length(1)])
             .split(inner);
-        frame.render_widget(Paragraph::new(text.to_string()).wrap(Wrap { trim: true }), rows[0]);
         frame.render_widget(
-            Paragraph::new("Press any key to continue")
+            Paragraph::new(text.to_string()).style(panel).wrap(Wrap { trim: true }),
+            rows[0],
+        );
+        frame.render_widget(
+            Paragraph::new("Press Enter to close")
                 .alignment(Alignment::Center)
-                .style(Style::default().fg(Color::Gray)),
+                .style(panel.fg(Color::Gray)),
             rows[1],
         );
     }

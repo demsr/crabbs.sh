@@ -246,9 +246,9 @@ Administration is split in two:
     below).
   - **Sysop tools**, a menu item of its own (main menu, sysops only): right
     now just the message of the day - free text, shown as a popup over the
-    main menu once, to everyone (guests included) right after they log in,
-    sized to the message rather than filling the screen; any key dismisses
-    it. Clearing it removes it. Meant to grow further as more sysop-only,
+    main menu once, to everyone (guests included) right after they log in;
+    Enter closes it, other keys are ignored while it's up. Clearing it
+    removes it. Meant to grow further as more sysop-only,
     non-content-specific functions get added.
 - **`bbsadmin`** is a command-line tool for everything else, run on the
   host with shell access. It works directly on the SQLite database using the
