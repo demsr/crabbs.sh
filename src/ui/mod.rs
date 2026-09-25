@@ -829,12 +829,8 @@ impl App {
                     Some(Action::Request(Request::OpenMailbox { folder }))
                 }
                 MessageEvent::Reply { to, subject, quote } => {
-                    let (a, c, b) = &quote;
-                    self.start_mail_compose(MailCompose::new(
-                        Some(&to),
-                        Some(&subject),
-                        Some((a.as_str(), c.as_str(), b.as_str())),
-                    ))
+                    let quote_ref = quote.as_ref().map(|(a, c, b)| (a.as_str(), c.as_str(), b.as_str()));
+                    self.start_mail_compose(MailCompose::new(Some(&to), Some(&subject), quote_ref))
                 }
                 MessageEvent::Delete(id) => Some(Action::Request(Request::DeleteMessage {
                     id,

@@ -202,9 +202,10 @@ impl TextArea {
 pub fn quote(author: &str, created: &str, body: &str) -> String {
     let mut out = format!("On {created}, {author} wrote:\n");
     for line in body.lines() {
-        if line.is_empty() {
-            out.push('>');
-        } else {
+        // A blank line in the original stays blank in the quote - no bare
+        // ">" marker for it - so a multi-paragraph quote doesn't read as
+        // if something got dropped in between.
+        if !line.is_empty() {
             out.push_str("> ");
             out.push_str(line);
         }
@@ -393,11 +394,11 @@ mod tests {
         let q = quote("alice", "2026-09-25 12:00", "hello\n\nworld");
         assert_eq!(
             q,
-            "On 2026-09-25 12:00, alice wrote:\n> hello\n>\n> world\n\n"
+            "On 2026-09-25 12:00, alice wrote:\n> hello\n\n> world\n\n"
         );
-        // Blank quoted lines are a bare ">", not "> " with trailing
-        // whitespace that would just get trimmed on the way to storage.
-        assert!(q.lines().any(|l| l == ">"));
+        // A blank line in the original stays blank in the quote - no bare
+        // ">" marker for it, which would otherwise look like a stray line.
+        assert!(!q.lines().any(|l| l == ">"));
         // Ends with a blank line separating the quote from where the
         // reply's own text will start, not running on right after it.
         assert!(q.ends_with("world\n\n"));

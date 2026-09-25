@@ -122,9 +122,11 @@ tool for everything else (renaming, reordering, deleting - see
 - Board list / thread list: ↑/↓, Enter to open, Esc to go back
 - Thread list: `n` starts a new thread, `m` marks the whole board as read,
   ←/→ (or `,` `.`) change page
-- Thread view: ↑/↓ scroll, `r` to reply, Esc back (to the list page you came
-  from); Space/PgDn reads on, ←/→ change page, `g`/`G` first/last page. `r`
-  quotes the most recent post on the page you're viewing (see Quoting below)
+- Thread view: ↑/↓ scroll, `r` to reply (with a quote), `R` to reply with no
+  quote, Esc back (to the list page you came from); Space/PgDn reads on, ←/→
+  change page, `g`/`G` first/last page. Whichever post is at the top of the
+  view is marked with `> ` on every one of its lines - that's the one `r`
+  quotes, and the mark tracks scrolling live (see Quoting below)
 - Editor: type normally (lines word-wrap at 78 columns), **Ctrl-D** posts,
   Esc cancels, Tab indents (4 spaces), Shift-Tab jumps back to the title,
   and Enter in the title moves to the message. Spacing and indentation are
@@ -151,7 +153,7 @@ more than 3 blank lines and blank lines at the start or end of a post.
 
 ### Quoting
 
-Replying (`r`, in a thread or reading a message) prefills the editor with
+Replying with `r` (in a thread or reading a message) prefills the editor with
 the original, classic BBS/email style:
 
 ```
@@ -162,9 +164,20 @@ On 2026-01-01 12:00, alice wrote:
 <cursor starts here>
 ```
 
-For mail this is always the message you're reading. For boards - which are
-flat, not threaded - it's the most recent post on the page you're currently
-viewing; open an earlier page first to quote something further back instead.
+Blank lines in the original stay blank in the quote - they're never given
+their own bare `>` - so a multi-paragraph quote doesn't read as if something
+got dropped in between.
+
+For mail this is always the message you're reading. Boards are flat, not
+threaded, so there's no single "the post being replied to" - instead,
+whichever post is at (or just above) the top of the thread view is quoted;
+its lines are all marked with `> ` right there in the view, live as you
+scroll with ↑/↓/PgUp/PgDn/`g`/`G`, so it's always obvious which one `r` will
+quote before you press it. Scroll to an earlier post first to quote
+something further back. `R` replies without quoting anything, regardless of
+what's currently marked - use it for a fresh reply that doesn't need to
+repeat the original.
+
 Trim or delete what you don't need, same as any other typed text; there's no
 length limit specific to the quote, just the normal 2000-character cap on
 the whole message.
@@ -229,8 +242,8 @@ pressing anything.
   sends, Esc cancels, Tab moves between fields. The message follows the same
   rules as posts (up to 2000 characters, spacing and indentation kept).
 - Reading a message marks it read. `r` replies (recipient, "Re:" subject and
-  a quote of the message all prefilled - see Quoting below), `d` deletes,
-  `b` blocks the sender.
+  a quote of the message all prefilled - see Quoting below), `R` replies with
+  no quote, `d` deletes, `b` blocks the sender.
 - Each side deletes only its own copy; a message disappears from the database
   once both have deleted it.
 - **Blocking:** a blocked user's mail is refused ("You can't send messages to

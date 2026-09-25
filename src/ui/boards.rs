@@ -608,8 +608,9 @@ pub enum ThreadEvent {
     Reply {
         thread_id: i64,
         title: String,
-        /// The post being replied to (author, when, body) - the last one
-        /// currently loaded, i.e. the most recent on this page.
+        /// The post being replied to (author, when, body) - the one marked
+        /// with "> " in the view, i.e. whichever is at the top of what's
+        /// currently on screen. `None` for a reply with no quote at all.
         quote: Option<(String, String, String)>,
     },
     /// Show another page of this thread.
@@ -640,6 +641,11 @@ pub struct ThreadView {
     /// Post (1-based index) to scroll to on the next draw, 0 for none. Set
     /// when opening a thread with unread posts.
     jump: Counter,
+    /// Index into `posts` of whichever post is at (or just above) the top
+    /// of the current view - the one 'r' quotes. Recomputed on every draw
+    /// from the scroll position, so it tracks reading without needing a
+    /// separate selection gesture.
+    quote_index: Counter,
 }
 
 impl ThreadView {
@@ -661,6 +667,7 @@ impl ThreadView {
             total_lines: Counter::new(0),
             page_height: Counter::new(10),
             jump: Counter::new(0),
+            quote_index: Counter::new(0),
         }
     }
 
@@ -766,8 +773,16 @@ impl ThreadView {
                     title: self.title.clone(),
                     quote: self
                         .posts
-                        .last()
+                        .get(self.quote_index.get())
                         .map(|p| (p.author.clone(), p.created.clone(), p.body.clone())),
+                };
+            }
+            // No quote at all, regardless of what's marked.
+            Key::Char('R') if self.loaded => {
+                return ThreadEvent::Reply {
+                    thread_id: self.thread_id,
+                    title: self.title.clone(),
+                    quote: None,
                 };
             }
             Key::Up | Key::Char('k') => self.scroll_by(-1),
@@ -827,14 +842,66 @@ impl ThreadView {
             .borders(Borders::ALL);
         let inner = block.inner(body);
 
-        let mut lines: Vec<Line> = Vec::new();
+        // First pass: wrap every post's body once, and use the resulting
+        // line counts to work out where each post starts - needed both for
+        // the existing scroll math and, new, to work out which post ends up
+        // at the top of the view once scroll is settled.
+        // Reserve two columns for a possible "> " marker up front, for every
+        // post, not just whichever one turns out to be marked - so wrapping
+        // doesn't reflow (and the scroll position it's keyed off doesn't
+        // jump) as the marked post changes while scrolling, and a body line
+        // that fills the reserved width never overflows the box once
+        // marked.
+        let wrap_width = (inner.width as usize).saturating_sub(2);
+        let wrapped: Vec<Vec<String>> = self
+            .posts
+            .iter()
+            .map(|p| wrap(&p.body, wrap_width))
+            .collect();
         let mut post_starts: Vec<usize> = Vec::new();
+        let mut total = usize::from(!self.loaded); // "Loading…" takes one line
+        for w in &wrapped {
+            post_starts.push(total);
+            total += 1 + w.len() + 1; // header + body + trailing spacer
+        }
+
+        self.total_lines.set(total);
+        self.page_height.set(inner.height as usize);
+        let max = total.saturating_sub(inner.height as usize);
+        // Opening a thread with unread posts starts at the first of them.
+        if let Some(&start) = self.jump.get().checked_sub(1).and_then(|i| post_starts.get(i)) {
+            self.scroll.set(start);
+        }
+        self.jump.set(0);
+        let scroll = self.scroll.get().min(max);
+        self.scroll.set(scroll);
+
+        // Whichever post is at (or just above) that scroll position is the
+        // one 'r' will quote; mark every one of its lines with "> " so it's
+        // obvious which one that is, live as you scroll.
+        let quote_index = post_starts.iter().rposition(|&start| start <= scroll);
+        if let Some(i) = quote_index {
+            self.quote_index.set(i);
+        }
+
+        // Second pass: the actual styled lines, now that we know which post
+        // (if any) gets marked.
+        let mut lines: Vec<Line> = Vec::new();
         if !self.loaded {
             lines.push(Line::from("Loading…"));
         }
-        for (i, post) in self.posts.iter().enumerate() {
-            post_starts.push(lines.len());
-            lines.push(Line::from(vec![
+        for (i, (post, body_lines)) in self.posts.iter().zip(&wrapped).enumerate() {
+            let marked = quote_index == Some(i);
+            let mark = |mut spans: Vec<Span<'static>>| -> Line<'static> {
+                if marked {
+                    let mut prefixed = vec![Span::styled("> ", Style::default().fg(Color::Cyan))];
+                    prefixed.append(&mut spans);
+                    Line::from(prefixed)
+                } else {
+                    Line::from(spans)
+                }
+            };
+            lines.push(mark(vec![
                 Span::styled(
                     format!("#{} {}", self.first_index() + i + 1, post.author),
                     Style::default()
@@ -848,24 +915,11 @@ impl ThreadView {
                 Span::styled(format!("  {}", post.created), DIM),
                 Span::styled(if post.unread { "  NEW" } else { "" }, NEW),
             ]));
-            lines.extend(
-                wrap(&post.body, inner.width as usize)
-                    .into_iter()
-                    .map(Line::from),
-            );
-            lines.push(Line::default());
+            for line in body_lines {
+                lines.push(mark(vec![Span::raw(line.clone())]));
+            }
+            lines.push(Line::default()); // spacer between posts, never marked
         }
-
-        self.total_lines.set(lines.len());
-        self.page_height.set(inner.height as usize);
-        let max = lines.len().saturating_sub(inner.height as usize);
-        // Opening a thread with unread posts starts at the first of them.
-        if let Some(&start) = self.jump.get().checked_sub(1).and_then(|i| post_starts.get(i)) {
-            self.scroll.set(start);
-        }
-        self.jump.set(0);
-        let scroll = self.scroll.get().min(max);
-        self.scroll.set(scroll);
 
         frame.render_widget(
             Paragraph::new(lines)
@@ -886,7 +940,7 @@ impl ThreadView {
             if self.pages > 1 {
                 text.push_str(" · ←/→: page · g/G: first/last");
             }
-            text.push_str(" · r: reply");
+            text.push_str(" · r: reply (quotes marked >) · R: reply, no quote");
             if self.sysop {
                 text.push_str(" · x: delete post");
             }
@@ -954,6 +1008,82 @@ mod tests {
 
     fn goto(target: PageTarget) -> impl Fn(&ThreadEvent) -> bool {
         move |e| matches!(e, ThreadEvent::Goto { thread_id: 9, target: t } if *t == target)
+    }
+
+    /// A thread of `n` posts, each a single short line, so each post takes
+    /// exactly 3 rendered lines (header + body + spacer). Renders it at
+    /// `height` rows starting at `scroll`, returning the view for further
+    /// assertions.
+    fn rendered(n: usize, height: u16, scroll: usize) -> ThreadView {
+        let posts = (0..n)
+            .map(|i| PostInfo {
+                id: 100 + i as i64,
+                author: format!("author{i}"),
+                author_is_sysop: false,
+                body: format!("post{i}"),
+                created: String::new(),
+                unread: false,
+            })
+            .collect();
+        let mut v = ThreadView::from_detail(
+            ThreadDetail {
+                id: 9,
+                board_id: 1,
+                board_name: "General".into(),
+                title: "T".into(),
+                posts,
+                page: 0,
+                pages: 1,
+                total: n,
+            },
+            false,
+            false,
+            0,
+        );
+        v.scroll.set(scroll);
+        let backend = ratatui::backend::TestBackend::new(40, height);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| {
+                let area = f.area();
+                v.draw(f, area);
+            })
+            .unwrap();
+        v
+    }
+
+    #[test]
+    fn quote_target_tracks_whichever_post_is_at_the_top_of_the_view() {
+        // 5 posts, viewport tall enough to show a bit more than one post's
+        // worth of lines (header + body + spacer = 3 lines) at a time.
+        let v = rendered(5, 6, 0);
+        assert_eq!(v.quote_index.get(), 0, "scrolled to the very top: post 0");
+
+        let v = rendered(5, 6, 3); // exactly post 1's first line
+        assert_eq!(v.quote_index.get(), 1);
+
+        let v = rendered(5, 6, 4); // partway into post 1
+        assert_eq!(v.quote_index.get(), 1);
+
+        let v = rendered(5, 6, 6); // exactly post 2's first line
+        assert_eq!(v.quote_index.get(), 2);
+
+        // Scrolled well past the end: clamped scroll still lands on a real,
+        // valid post (the last one), never past the end of `posts`.
+        let v = rendered(5, 6, 9999);
+        assert!(v.quote_index.get() < 5);
+    }
+
+    #[test]
+    fn r_quotes_the_tracked_post_and_big_r_never_quotes_anything() {
+        let mut v = rendered(3, 6, 3); // top of view is post 1
+        let event = v.handle(Key::Char('r'));
+        assert!(matches!(&event, ThreadEvent::Reply { quote: Some((a, _, b)), .. }
+            if a == "author1" && b == "post1"));
+
+        let mut v = rendered(3, 6, 3);
+        let event = v.handle(Key::Char('R'));
+        assert!(matches!(event, ThreadEvent::Reply { quote: None, .. }));
     }
 
     #[test]
@@ -1052,18 +1182,10 @@ mod tests {
             if a == "a" && c.is_empty() && b == "x"));
     }
 
-    #[test]
-    fn reply_quotes_the_last_post_on_the_page_not_the_first() {
-        let mut v = view(0, 1, false);
-        v.posts[0].body = "first post".into();
-        v.posts[0].author = "alice".into();
-        let last = v.posts.len() - 1;
-        v.posts[last].body = "most recent post".into();
-        v.posts[last].author = "bob".into();
-        let event = v.handle(Key::Char('r'));
-        assert!(matches!(&event, ThreadEvent::Reply { quote: Some((a, _, b)), .. }
-            if a == "bob" && b == "most recent post"));
-    }
+    // Superseded by quote_target_tracks_whichever_post_is_at_the_top_of_the_view
+    // and r_quotes_the_tracked_post_and_big_r_never_quotes_anything: which
+    // post 'r' quotes now follows the scroll position (tracked live via a
+    // real draw()), not simply "whichever post is last in the array".
 
     #[test]
     fn delete_prompt_uses_thread_wide_numbers_on_this_page_only() {

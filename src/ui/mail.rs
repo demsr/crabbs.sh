@@ -209,7 +209,8 @@ pub enum MessageEvent {
     Reply {
         to: String,
         subject: String,
-        quote: (String, String, String),
+        /// `None` for a reply with no quote.
+        quote: Option<(String, String, String)>,
     },
     Delete(i64),
     Block(String),
@@ -272,11 +273,19 @@ impl MessageScreen {
                 return MessageEvent::Reply {
                     to: self.message.from.clone(),
                     subject: reply_subject(&self.message.subject),
-                    quote: (
+                    quote: Some((
                         self.message.from.clone(),
                         self.message.created.clone(),
                         self.message.body.clone(),
-                    ),
+                    )),
+                };
+            }
+            // No quote at all.
+            Key::Char('R') if can_reply => {
+                return MessageEvent::Reply {
+                    to: self.message.from.clone(),
+                    subject: reply_subject(&self.message.subject),
+                    quote: None,
                 };
             }
             Key::Char('d') | Key::Delete => self.confirm = Some(Confirm::Delete),
@@ -349,7 +358,7 @@ impl MessageScreen {
             None => {
                 let mut text = String::from("↑/↓/PgUp/PgDn: scroll");
                 if m.is_recipient {
-                    text.push_str(" · r: reply");
+                    text.push_str(" · r: reply (quotes it) · R: reply, no quote");
                 }
                 text.push_str(" · d: delete");
                 if m.is_recipient && m.from != m.to {
@@ -640,7 +649,10 @@ mod tests {
         let mut inbox = MessageScreen::new(message(true));
         let event = inbox.handle(Key::Char('r'));
         assert!(matches!(&event, MessageEvent::Reply { to, subject, .. } if to == "alice" && subject == "Re: Hi"));
-        assert!(matches!(&event, MessageEvent::Reply { quote, .. } if quote == &("alice".to_string(), "2026-01-01 00:00".to_string(), "text".to_string())));
+        assert!(matches!(&event, MessageEvent::Reply { quote, .. }
+            if quote == &Some(("alice".to_string(), "2026-01-01 00:00".to_string(), "text".to_string()))));
+        // 'R' replies to the same message with no quote at all.
+        assert!(matches!(inbox.handle(Key::Char('R')), MessageEvent::Reply { quote: None, .. }));
         inbox.handle(Key::Char('b'));
         assert!(matches!(inbox.handle(Key::Char('y')), MessageEvent::Block(ref n) if n == "alice"));
         assert!(matches!(inbox.handle(Key::Esc), MessageEvent::Back(Folder::Inbox)));
