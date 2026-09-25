@@ -245,10 +245,11 @@ Administration is split in two:
     Renaming, reordering and deleting a board are still `bbsadmin`-only (see
     below).
   - **Sysop tools**, a menu item of its own (main menu, sysops only): right
-    now just the message of the day - free text, shown once to everyone
-    (guests included) right after they log in; clearing it removes it.
-    Meant to grow further as more sysop-only, non-content-specific functions
-    get added.
+    now just the message of the day - free text, shown as a popup over the
+    main menu once, to everyone (guests included) right after they log in,
+    sized to the message rather than filling the screen; any key dismisses
+    it. Clearing it removes it. Meant to grow further as more sysop-only,
+    non-content-specific functions get added.
 - **`bbsadmin`** is a command-line tool for everything else, run on the
   host with shell access. It works directly on the SQLite database using the
   same code as the server, and can run while the server is up; changes apply

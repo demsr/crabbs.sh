@@ -15,7 +15,7 @@ use std::collections::VecDeque;
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
 
 use crate::chat::{ChatEvent, ChatSnapshot};
 use crate::db::{Folder, MailItem, MailMessage};
@@ -339,9 +339,6 @@ enum Screen {
     Blocks(BlocksScreen),
     SysopMenu(SysopMenu),
     MotdEditor(MotdEditor),
-    /// The message of the day, shown once right after login. Any key
-    /// dismisses it and moves on to the main menu.
-    Motd(String),
 }
 
 /// Like `ComposeScreen`: remembers where to return if cancelled.
@@ -372,6 +369,11 @@ pub struct App {
     unread_threads: i64,
     /// Unread messages in the inbox, shown on the main menu.
     unread_mail: i64,
+    /// The message of the day, shown as a popup over whatever screen is
+    /// current (in practice always the menu, right after login) until any
+    /// key dismisses it. Deliberately not a `Screen`: unlike every other
+    /// screen it overlays rather than replaces what's underneath.
+    motd_popup: Option<String>,
 }
 
 impl App {
@@ -383,12 +385,10 @@ impl App {
         self.unread_mail = count;
     }
 
-    /// If a message of the day is set, shows it first instead of the menu.
-    /// Called once, right after construction.
+    /// If a message of the day is set, shows it as a popup. Called once,
+    /// right after construction.
     pub fn set_motd(&mut self, text: Option<String>) {
-        if let Some(text) = text.filter(|t| !t.is_empty()) {
-            self.screen = Screen::Motd(text);
-        }
+        self.motd_popup = text.filter(|t| !t.is_empty());
     }
 
     /// Mail was delivered somewhere. If it's for this user, note it. Returns
@@ -420,11 +420,15 @@ impl App {
             queue: VecDeque::new(),
             unread_threads: 0,
             unread_mail: 0,
+            motd_popup: None,
         }
     }
 
     /// What the session is doing, for the who's-online list.
     pub fn activity(&self) -> &'static str {
+        if self.motd_popup.is_some() {
+            return "Reading the message of the day";
+        }
         match self.screen {
             Screen::Menu | Screen::About => "Main menu",
             Screen::Register(_) => "Registering",
@@ -439,7 +443,6 @@ impl App {
             Screen::Mailbox(_) | Screen::Message(_) | Screen::Blocks(_) => "Reading mail",
             Screen::MailCompose(_) => "Writing mail",
             Screen::SysopMenu(_) | Screen::MotdEditor(_) => "Sysop tools",
-            Screen::Motd(_) => "Reading the message of the day",
         }
     }
 
@@ -676,15 +679,16 @@ impl App {
 
     fn handle_key(&mut self, key: Key) -> Option<Action> {
         self.status = None;
+        // Any key dismisses the popup, and only dismisses it - it's not
+        // otherwise handled by whatever screen is underneath.
+        if self.motd_popup.take().is_some() {
+            return None;
+        }
         let sysop = self.identity.is_sysop();
         let member = self.identity.user_id().is_some();
         match &mut self.screen {
             Screen::Menu => self.handle_menu_key(key),
             Screen::About => {
-                self.screen = Screen::Menu;
-                None
-            }
-            Screen::Motd(_) => {
                 self.screen = Screen::Menu;
                 None
             }
@@ -1020,9 +1024,14 @@ impl App {
             Screen::Blocks(blocks) => blocks.draw(frame, body),
             Screen::SysopMenu(menu) => menu.draw(frame, body),
             Screen::MotdEditor(editor) => editor.draw(frame, body),
-            Screen::Motd(text) => Self::draw_motd(text, frame, body),
         }
         self.draw_status(frame, chunks[2]);
+
+        // Drawn last, on top of everything above: a popup over whatever
+        // screen is showing, not a screen of its own.
+        if let Some(text) = &self.motd_popup {
+            Self::draw_motd_popup(text, frame);
+        }
     }
 
     fn draw_header(&self, frame: &mut Frame, area: Rect) {
@@ -1060,19 +1069,43 @@ impl App {
         frame.render_stateful_widget(list, area, &mut state);
     }
 
-    fn draw_motd(text: &str, frame: &mut Frame, area: Rect) {
+    /// A popup centered over the whole frame, sized to the message (within
+    /// reasonable bounds) rather than a fixed fraction of the screen, so a
+    /// one-line MOTD doesn't look like an oversized empty box.
+    fn draw_motd_popup(text: &str, frame: &mut Frame) {
+        let full = frame.area();
+        let width = (full.width * 7 / 10)
+            .max(40.min(full.width))
+            .min(full.width.saturating_sub(4).max(1));
+        let wrapped = text::wrap(text, width.saturating_sub(2).max(1) as usize).len() as u16;
+        let height = (wrapped + 3) // borders (2) + the hint line (1)
+            .max(6.min(full.height))
+            .min((full.height * 4 / 5).max(1))
+            .min(full.height);
+        let area = Rect {
+            x: full.x + full.width.saturating_sub(width) / 2,
+            y: full.y + full.height.saturating_sub(height) / 2,
+            width,
+            height,
+        };
+
+        frame.render_widget(Clear, area);
+        let block = Block::default()
+            .title(" Message of the day ")
+            .border_style(Style::default().fg(Color::Cyan))
+            .borders(Borders::ALL);
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+
         let rows = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Min(3), Constraint::Length(1)])
-            .split(area);
+            .constraints([Constraint::Min(0), Constraint::Length(1)])
+            .split(inner);
+        frame.render_widget(Paragraph::new(text.to_string()).wrap(Wrap { trim: true }), rows[0]);
         frame.render_widget(
-            Paragraph::new(text.to_string())
-                .wrap(Wrap { trim: true })
-                .block(Block::default().title("Message of the day").borders(Borders::ALL)),
-            rows[0],
-        );
-        frame.render_widget(
-            Paragraph::new("Press any key to continue").style(Style::default().fg(Color::Gray)),
+            Paragraph::new("Press any key to continue")
+                .alignment(Alignment::Center)
+                .style(Style::default().fg(Color::Gray)),
             rows[1],
         );
     }
