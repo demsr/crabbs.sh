@@ -777,8 +777,9 @@ impl ThreadView {
                         .map(|p| (p.author.clone(), p.created.clone(), p.body.clone())),
                 };
             }
-            // No quote at all, regardless of what's marked.
-            Key::Char('R') if self.loaded => {
+            // A fresh message in the thread, no quote at all, regardless of
+            // what's marked - 'c' for "compose", mirroring mail's 'c'.
+            Key::Char('c') if self.loaded => {
                 return ThreadEvent::Reply {
                     thread_id: self.thread_id,
                     title: self.title.clone(),
@@ -865,12 +866,11 @@ impl ThreadView {
         // line counts to work out where each post starts - needed both for
         // the existing scroll math and, new, to work out which post ends up
         // at the top of the view once scroll is settled.
-        // Reserve two columns for a possible "> " marker up front, for every
-        // post, not just whichever one turns out to be marked - so wrapping
-        // doesn't reflow (and the scroll position it's keyed off doesn't
-        // jump) as the marked post changes while scrolling, and a body line
-        // that fills the reserved width never overflows the box once
-        // marked.
+        // Reserve two columns for the "> "/"  " gutter every post always
+        // gets (see `mark` below) - so wrapping doesn't reflow (and the
+        // scroll position it's keyed off doesn't jump) as the marked post
+        // changes while scrolling, and a body line that fills the reserved
+        // width never overflows the box.
         let wrap_width = (inner.width as usize).saturating_sub(2);
         let wrapped: Vec<Vec<String>> = self
             .posts
@@ -918,14 +918,14 @@ impl ThreadView {
         }
         for (i, (post, body_lines)) in self.posts.iter().zip(&wrapped).enumerate() {
             let marked = self.quote_index.get() == i;
+            // Every post gets the same 2-column gutter reserved, marked or
+            // not - only the glyph in it changes - so marking a post never
+            // shifts its text (or any other post's) sideways.
             let mark = |mut spans: Vec<Span<'static>>| -> Line<'static> {
-                if marked {
-                    let mut prefixed = vec![Span::styled("> ", Style::default().fg(Color::Cyan))];
-                    prefixed.append(&mut spans);
-                    Line::from(prefixed)
-                } else {
-                    Line::from(spans)
-                }
+                let gutter = if marked { "> " } else { "  " };
+                let mut prefixed = vec![Span::styled(gutter, Style::default().fg(Color::Cyan))];
+                prefixed.append(&mut spans);
+                Line::from(prefixed)
             };
             lines.push(mark(vec![
                 Span::styled(
@@ -966,7 +966,7 @@ impl ThreadView {
             if self.pages > 1 {
                 text.push_str(" · ←/→: page · g/G: first/last");
             }
-            text.push_str(" · r: reply (quotes marked >) · R: reply, no quote");
+            text.push_str(" · r: reply (quotes marked >) · c: compose, no quote");
             if self.sysop {
                 text.push_str(" · x: delete post");
             }
@@ -1101,14 +1101,14 @@ mod tests {
     }
 
     #[test]
-    fn r_quotes_the_tracked_post_and_big_r_never_quotes_anything() {
+    fn r_quotes_the_tracked_post_and_c_never_quotes_anything() {
         let mut v = rendered(3, 6, 3); // top of view is post 1
         let event = v.handle(Key::Char('r'));
         assert!(matches!(&event, ThreadEvent::Reply { quote: Some((a, _, b)), .. }
             if a == "author1" && b == "post1"));
 
         let mut v = rendered(3, 6, 3);
-        let event = v.handle(Key::Char('R'));
+        let event = v.handle(Key::Char('c'));
         assert!(matches!(event, ThreadEvent::Reply { quote: None, .. }));
     }
 
@@ -1241,7 +1241,7 @@ mod tests {
     }
 
     // Superseded by quote_target_tracks_whichever_post_is_at_the_top_of_the_view
-    // and r_quotes_the_tracked_post_and_big_r_never_quotes_anything: which
+    // and r_quotes_the_tracked_post_and_c_never_quotes_anything: which
     // post 'r' quotes now follows the scroll position (tracked live via a
     // real draw()), not simply "whichever post is last in the array".
 

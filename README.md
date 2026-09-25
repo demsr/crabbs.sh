@@ -122,11 +122,12 @@ tool for everything else (renaming, reordering, deleting - see
 - Board list / thread list: ↑/↓, Enter to open, Esc to go back
 - Thread list: `n` starts a new thread, `m` marks the whole board as read,
   ←/→ (or `,` `.`) change page
-- Thread view: ↑/↓ scroll, `r` to reply (with a quote), `R` to reply with no
-  quote, Esc back (to the list page you came from); Space/PgDn reads on, ←/→
-  change page, `g`/`G` first/last page. Whichever post is at the top of the
-  view is marked with `> ` on every one of its lines - that's the one `r`
-  quotes, and the mark tracks scrolling live (see Quoting below)
+- Thread view: ↑/↓ scroll, `r` to reply (with a quote), `c` to compose a
+  fresh message in the thread with no quote, Esc back (to the list page you
+  came from); Space/PgDn reads on, ←/→ change page, `g`/`G` first/last page.
+  Whichever post is at the top of the view is marked with `> ` on every one
+  of its lines - that's the one `r` quotes, and the mark tracks scrolling
+  live (see Quoting below)
 - Editor: type normally (lines word-wrap at 78 columns), **Ctrl-D** posts,
   Esc cancels, Tab indents (4 spaces), Shift-Tab jumps back to the title,
   and Enter in the title moves to the message. Spacing and indentation are
@@ -174,9 +175,10 @@ whichever post is at (or just above) the top of the thread view is quoted;
 its lines are all marked with `> ` right there in the view, live as you
 scroll with ↑/↓/PgUp/PgDn/`g`/`G`, so it's always obvious which one `r` will
 quote before you press it. Scroll to an earlier post first to quote
-something further back. `R` replies without quoting anything, regardless of
-what's currently marked - use it for a fresh reply that doesn't need to
-repeat the original.
+something further back. `c` composes a fresh message in the thread without
+quoting anything, regardless of what's currently marked - use it when the
+reply doesn't need to repeat the original (mail's equivalent is `R`, since
+mail already uses `c` for a brand-new, unrelated message).
 
 Trim or delete what you don't need, same as any other typed text; there's no
 length limit specific to the quote, just the normal 2000-character cap on
